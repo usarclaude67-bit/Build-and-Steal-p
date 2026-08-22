@@ -1,0 +1,322 @@
+-- ==========================================
+-- [CONTA PRINCIPAL] RADAR DE PETS 🔴⚫
+-- Função: GUI Moderna, Animações, Mobile Fix e Ordem por MPS
+-- ==========================================
+
+local CoreGui = game:GetService("CoreGui")
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local player = Players.LocalPlayer
+
+-- ================= CONFS ==================
+local BIN_ID = "6a88cc4dda38895dfe01774c"
+local API_KEY = "$2a$10$jL97tdhOdH1.whfusZplCuhcVH/i.SOFVkGJKkBi1OyDjdcFFn2XG"
+local GUI_NAME = "RadarMengaoGUI"
+local UPDATE_COOLDOWN = 1
+
+-- ================ LIMPEZA =================
+for _, gui in pairs(CoreGui:GetChildren()) do
+    if gui.Name == GUI_NAME then gui:Destroy() end
+end
+for _, gui in pairs(player:WaitForChild("PlayerGui"):GetChildren()) do
+    if gui.Name == GUI_NAME then gui:Destroy() end
+end
+
+-- ================= FUNÇÕES DE ANIMAÇÃO =================
+local function CriarTween(objeto, propriedades, tempo)
+    local tweenInfo = TweenInfo.new(tempo or 0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local tween = TweenService:Create(objeto, tweenInfo, propriedades)
+    tween:Play()
+    return tween
+end
+
+local function AnimarBotao(botao, corNormal, corHover)
+    botao.BackgroundColor3 = corNormal
+    botao.MouseEnter:Connect(function() CriarTween(botao, {BackgroundColor3 = corHover}) end)
+    botao.MouseLeave:Connect(function() CriarTween(botao, {BackgroundColor3 = corNormal}) end)
+    -- Suporte extra para toque no Mobile
+    botao.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch then
+            CriarTween(botao, {BackgroundColor3 = corHover}, 0.1)
+        end
+    end)
+    botao.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch then
+            CriarTween(botao, {BackgroundColor3 = corNormal}, 0.3)
+        end
+    end)
+end
+
+-- ================== GUI PRINCIPAL ===================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = GUI_NAME
+ScreenGui.ResetOnSpawn = false
+local success = pcall(function() ScreenGui.Parent = CoreGui end)
+if not success then ScreenGui.Parent = player:WaitForChild("PlayerGui") end
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 340, 0, 300)
+MainFrame.Position = UDim2.new(0.5, -170, 0.5, -150)
+MainFrame.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+MainFrame.BackgroundTransparency = 0.7 -- Fundo transparente solicitado
+MainFrame.BorderSizePixel = 0
+MainFrame.ClipsDescendants = true
+MainFrame.Active = true
+MainFrame.Parent = ScreenGui
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 10) -- Cantos mais redondos
+MainCorner.Parent = MainFrame
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = Color3.fromRGB(220, 20, 60) 
+MainStroke.Thickness = 1.5
+MainStroke.Transparency = 0.2
+MainStroke.Parent = MainFrame
+
+-- Efeito pulsante na borda
+TweenService:Create(MainStroke, TweenInfo.new(2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {Transparency = 0.8}):Play()
+
+local TopBar = Instance.new("Frame")
+TopBar.Size = UDim2.new(1, 0, 0, 40)
+TopBar.BackgroundColor3 = Color3.fromRGB(20, 5, 5)
+TopBar.BackgroundTransparency = 0.4
+TopBar.BorderSizePixel = 0
+TopBar.Active = true
+TopBar.Parent = MainFrame
+
+local TitleBar = Instance.new("TextLabel")
+TitleBar.Size = UDim2.new(1, -110, 1, 0)
+TitleBar.Position = UDim2.new(0, 15, 0, 0)
+TitleBar.BackgroundTransparency = 1
+TitleBar.Text = "<b><font color='#ff2a4b'>🔴⚫ RADAR</font> <font color='#ffffff' size='11'>[ 35M+ ]</font></b>"
+TitleBar.RichText = true
+TitleBar.TextColor3 = Color3.fromRGB(255, 255, 255)
+TitleBar.Font = Enum.Font.GothamBold
+TitleBar.TextSize = 14
+TitleBar.TextXAlignment = Enum.TextXAlignment.Left
+TitleBar.Parent = TopBar
+
+local RefreshBtn = Instance.new("TextButton")
+RefreshBtn.Size = UDim2.new(0, 65, 0, 24)
+RefreshBtn.Position = UDim2.new(1, -105, 0.5, -12)
+RefreshBtn.Text = "ATUALIZAR"
+RefreshBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+RefreshBtn.Font = Enum.Font.GothamBold
+RefreshBtn.TextSize = 10
+RefreshBtn.AutoButtonColor = false
+RefreshBtn.Parent = TopBar
+Instance.new("UICorner", RefreshBtn).CornerRadius = UDim.new(0, 6)
+AnimarBotao(RefreshBtn, Color3.fromRGB(150, 20, 40), Color3.fromRGB(200, 30, 50))
+
+local MinimizeBtn = Instance.new("TextButton")
+MinimizeBtn.Size = UDim2.new(0, 28, 0, 24)
+MinimizeBtn.Position = UDim2.new(1, -35, 0.5, -12)
+MinimizeBtn.Text = "-"
+MinimizeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+MinimizeBtn.Font = Enum.Font.GothamBold
+MinimizeBtn.TextSize = 16
+MinimizeBtn.AutoButtonColor = false
+MinimizeBtn.Parent = TopBar
+Instance.new("UICorner", MinimizeBtn).CornerRadius = UDim.new(0, 6)
+AnimarBotao(MinimizeBtn, Color3.fromRGB(40, 10, 10), Color3.fromRGB(80, 20, 20))
+
+local ScrollingFrame = Instance.new("ScrollingFrame")
+ScrollingFrame.Size = UDim2.new(1, 0, 1, -45)
+ScrollingFrame.Position = UDim2.new(0, 0, 0, 45)
+ScrollingFrame.BackgroundTransparency = 1
+ScrollingFrame.BorderSizePixel = 0
+ScrollingFrame.ScrollBarThickness = 3
+ScrollingFrame.ScrollBarImageColor3 = Color3.fromRGB(220, 20, 60)
+ScrollingFrame.Active = true
+ScrollingFrame.Parent = MainFrame
+
+local UIListLayout = Instance.new("UIListLayout")
+UIListLayout.Parent = ScrollingFrame
+UIListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+UIListLayout.Padding = UDim.new(0, 6)
+UIListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+Instance.new("UIPadding", ScrollingFrame).PaddingTop = UDim.new(0, 5)
+
+-- ================ LÓGICAS DE UI =================
+local minimizado = false
+MinimizeBtn.MouseButton1Click:Connect(function()
+    minimizado = not minimizado
+    if minimizado then
+        MinimizeBtn.Text = "+"
+        ScrollingFrame.Visible = false
+        CriarTween(MainFrame, {Size = UDim2.new(0, 340, 0, 40)}, 0.4)
+    else
+        MinimizeBtn.Text = "-"
+        CriarTween(MainFrame, {Size = UDim2.new(0, 340, 0, 300)}, 0.4)
+        task.delay(0.4, function() ScrollingFrame.Visible = true end)
+    end
+end)
+
+-- SISTEMA DE DRAG PERFEITO (MOBILE E PC)
+local dragging, dragInput, dragStart, startPos
+TopBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = MainFrame.Position
+        
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+TopBar.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        local delta = input.Position - dragStart
+        MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+
+-- ================ SISTEMA CORE =================
+local function ConverterParaNumero(mpsString)
+    if type(mpsString) == "number" then return mpsString end
+    local num = tonumber(string.match(mpsString or "", "[%d%.]+")) or 0
+    local sulfixo = string.match(string.upper(mpsString or ""), "%a+")
+    
+    if sulfixo == "K" then num = num * 1e3
+    elseif sulfixo == "M" then num = num * 1e6
+    elseif sulfixo == "B" then num = num * 1e9
+    elseif sulfixo == "T" then num = num * 1e12
+    elseif sulfixo == "Q" or sulfixo == "QD" then num = num * 1e15
+    end
+    return num
+end
+
+local function ObterTagServidor(jobId)
+    if not jobId or jobId == "" then return "???" end
+    return (jobId == game.JobId) and "server1" or "server2"
+end
+
+local function CriarNotificacao(title, mps, mutation, jobId)
+    local LogItem = Instance.new("Frame")
+    LogItem.Size = UDim2.new(1, -20, 0, 65)
+    LogItem.BackgroundTransparency = 0.3
+    LogItem.BorderSizePixel = 0
+    
+    local mpsNumerico = ConverterParaNumero(mps)
+    LogItem.LayoutOrder = -mpsNumerico 
+    LogItem.Parent = ScrollingFrame
+
+    Instance.new("UICorner", LogItem).CornerRadius = UDim.new(0, 8)
+    
+    local ItemStroke = Instance.new("UIStroke")
+    ItemStroke.Color = Color3.fromRGB(100, 20, 30)
+    ItemStroke.Thickness = 1
+    ItemStroke.Transparency = 0.5
+    ItemStroke.Parent = LogItem
+
+    -- Animação de entrada suave
+    LogItem.Size = UDim2.new(1, -40, 0, 55)
+    LogItem.BackgroundTransparency = 1
+    CriarTween(LogItem, {Size = UDim2.new(1, -20, 0, 65), BackgroundTransparency = 0.3, BackgroundColor3 = Color3.fromRGB(20, 20, 20)}, 0.3)
+
+    local InfoLabel = Instance.new("TextLabel")
+    InfoLabel.Size = UDim2.new(1, -85, 1, 0)
+    InfoLabel.Position = UDim2.new(0, 12, 0, 0)
+    InfoLabel.BackgroundTransparency = 1
+    InfoLabel.RichText = true
+    InfoLabel.TextXAlignment = Enum.TextXAlignment.Left
+    InfoLabel.Font = Enum.Font.GothamMedium
+    InfoLabel.TextSize = 13
+    InfoLabel.Parent = LogItem
+    
+    local serverTag = ObterTagServidor(jobId)
+    local corServidor = (serverTag == "server1") and "#00ff66" or "#ff9900"
+    local mutText = (mutation and mutation ~= "") and (" <font color='#ff4d4d'>[" .. mutation .. "]</font>") or ""
+    
+    InfoLabel.Text = "<b><font color='#ffffff'>" .. title .. " <font color='".. corServidor .."'>[".. serverTag .."]</font></font></b>" .. mutText .. "\n<font color='#aaaaaa'>MPS:</font> <b><font color='#00ffff'>" .. tostring(mps) .. "</font></b>"
+
+    local JoinBtn = Instance.new("TextButton")
+    JoinBtn.Size = UDim2.new(0, 65, 0, 36)
+    JoinBtn.Position = UDim2.new(1, -75, 0.5, -18)
+    JoinBtn.Text = "JOIN"
+    JoinBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    JoinBtn.Font = Enum.Font.GothamBlack
+    JoinBtn.TextSize = 12
+    JoinBtn.AutoButtonColor = false
+    JoinBtn.Parent = LogItem
+
+    Instance.new("UICorner", JoinBtn).CornerRadius = UDim.new(0, 6)
+    AnimarBotao(JoinBtn, Color3.fromRGB(200, 20, 40), Color3.fromRGB(255, 40, 60))
+
+    JoinBtn.MouseButton1Click:Connect(function()
+        JoinBtn.Text = "INDO..."
+        CriarTween(JoinBtn, {BackgroundColor3 = Color3.fromRGB(80, 80, 80)}, 0.2)
+        if jobId and jobId ~= "" then
+            pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, player)
+            end)
+        end
+    end)
+
+    task.delay(60, function()
+        if LogItem then 
+            local fadeOut = CriarTween(LogItem, {BackgroundTransparency = 1, Size = UDim2.new(1, -40, 0, 0)}, 0.3)
+            fadeOut.Completed:Connect(function() LogItem:Destroy() end)
+        end
+    end)
+end
+
+local ultimoTimestamp = 0
+
+local function checarNuvem()
+    task.spawn(function()
+        pcall(function()
+            local url = "https://api.jsonbin.io/v3/b/" .. BIN_ID .. "/latest"
+            local response = HttpService:RequestAsync({
+                Url = url,
+                Method = "GET",
+                Headers = {["X-Master-Key"] = API_KEY}
+            })
+            
+            if response.Success then
+                local decoded = HttpService:JSONDecode(response.Body)
+                local record = decoded.record
+                
+                if record and record.Timestamp and record.Timestamp > ultimoTimestamp then
+                    ultimoTimestamp = record.Timestamp
+                    
+                    if record.Pets then
+                        for _, pet in ipairs(record.Pets) do
+                            local currentJobId = pet.JobId or record.JobId
+                            CriarNotificacao(pet.Title, pet.MPS, pet.Mutation, currentJobId)
+                            task.wait(0.1) -- Suaviza a criação da lista
+                        end
+                    elseif record.Title then 
+                        CriarNotificacao(record.Title, record.MPS, record.Mutation, record.JobId)
+                    end
+                end
+            end
+        end)
+    end)
+end
+
+RefreshBtn.MouseButton1Click:Connect(function()
+    RefreshBtn.Text = "..."
+    checarNuvem()
+    task.delay(0.5, function() RefreshBtn.Text = "ATUALIZAR" end)
+end)
+
+task.spawn(function()
+    while true do
+        checarNuvem()
+        task.wait(UPDATE_COOLDOWN)
+    end
+end)
