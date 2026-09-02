@@ -1,0 +1,532 @@
+-- ========================================================================
+--  [ PHANTOM HUB 👻 ] MOBILE, ESP, TP LAUNCHPAD, BEAM & DISTANCE COLORS
+-- ========================================================================
+
+local Players = game:GetService("Players")
+local CoreGui = game:GetService("CoreGui")
+local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+
+local THEME = {
+    Background = Color3.fromRGB(12, 15, 20),
+    Surface = Color3.fromRGB(22, 28, 36),
+    Accent = Color3.fromRGB(170, 255, 220), 
+    Text = Color3.fromRGB(240, 240, 255),
+    TextDim = Color3.fromRGB(140, 150, 160)
+}
+
+-- Cores baseadas na distância
+local COLOR_NEAR = Color3.fromRGB(255, 40, 40)  -- Vermelho (<= 50m)
+local COLOR_FAR = Color3.fromRGB(40, 150, 255)  -- Azul (> 50m)
+
+local GUI_NAME = "PhantomFarmHub_Mobile"
+
+local function getTargetUI()
+    local target
+    pcall(function() target = gethui and gethui() or CoreGui end)
+    if not target or (typeof(target) == "Instance" and target.Name == "CoreGui" and not pcall(function() local _ = Instance.new("ScreenGui", target) end)) then
+        target = player:WaitForChild("PlayerGui", 5)
+    end
+    return target
+end
+
+local targetGui = getTargetUI()
+if targetGui then
+    for _, gui in pairs(targetGui:GetChildren()) do 
+        if gui.Name == GUI_NAME then gui:Destroy() end 
+    end
+end
+
+-- ========================================================================
+-- PERSISTÊNCIA DE VELOCIDADE (41 FIXO)
+-- ========================================================================
+local function enforceWalkSpeed(char)
+    local hum = char:WaitForChild("Humanoid", 5)
+    if hum then
+        hum.WalkSpeed = 41
+        hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+            if hum.WalkSpeed ~= 41 then hum.WalkSpeed = 41 end
+        end)
+    end
+end
+
+if player.Character then enforceWalkSpeed(player.Character) end
+player.CharacterAdded:Connect(enforceWalkSpeed)
+
+-- ========================================================================
+-- LÓGICA DO PLOT E LAUNCHPAD (MY BASE) COM ATTRIBUTE
+-- ========================================================================
+local function GetPlayerLaunchPad()
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then return nil end
+    
+    for _, plot in ipairs(plots:GetChildren()) do
+        local ownerId = plot:GetAttribute("OwnerUserId")
+        if ownerId and tostring(ownerId) == tostring(player.UserId) then
+            local builds = plot:FindFirstChild("Builds")
+            if builds then
+                local pad = builds:FindFirstChild("LaunchPad")
+                if pad and (pad:IsA("BasePart") or pad:IsA("Model")) then
+                    return pad:IsA("Model") and (pad.PrimaryPart or pad:FindFirstChildWhichIsA("BasePart")) or pad
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- ========================================================================
+-- BEAM (LINHA) ATÉ O LAUNCHPAD
+-- ========================================================================
+task.spawn(function()
+    while task.wait(1.5) do
+        pcall(function()
+            local pad = GetPlayerLaunchPad()
+            local char = player.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+
+            if pad and hrp then
+                local att0 = hrp:FindFirstChild("PadBeamAtt0") or Instance.new("Attachment", hrp)
+                att0.Name = "PadBeamAtt0"
+                att0.Position = Vector3.new(0, 0, 0)
+                
+                local att1 = pad:FindFirstChild("PadBeamAtt1") or Instance.new("Attachment", pad)
+                att1.Name = "PadBeamAtt1"
+
+                local beam = Workspace:FindFirstChild("MyBaseLaunchPadBeam")
+                if not beam then
+                    beam = Instance.new("Beam", Workspace)
+                    beam.Name = "MyBaseLaunchPadBeam"
+                    beam.Width0 = 0.08
+                    beam.Width1 = 0.08
+                    beam.FaceCamera = true
+                    beam.LightEmission = 1
+                    beam.ZOffset = 1
+                    beam.Transparency = NumberSequence.new(0.2)
+                end
+                
+                beam.Attachment0 = att0
+                beam.Attachment1 = att1
+                beam.Enabled = true
+            else
+                local beam = Workspace:FindFirstChild("MyBaseLaunchPadBeam")
+                if beam then beam.Enabled = false end
+            end
+        end)
+    end
+end)
+
+-- ========================================================================
+-- SISTEMA DE ESP E HIGHLIGHTS GLOBAIS
+-- ========================================================================
+local ESP = { Highlight = Instance.new("Highlight"), Billboard = Instance.new("BillboardGui"), TextLabel = Instance.new("TextLabel"), Stroke = nil }
+local PlayerESPs = {}
+
+function ESP.Init()
+    pcall(function()
+        ESP.Highlight.Name = "GhostAura"
+        ESP.Highlight.FillTransparency = 0.85
+        ESP.Highlight.OutlineTransparency = 0.2
+        
+        ESP.Billboard.Name = "GhostTag"
+        ESP.Billboard.Size = UDim2.fromOffset(100, 35)
+        ESP.Billboard.AlwaysOnTop = true
+        ESP.Billboard.StudsOffset = Vector3.new(0, 5, 0)
+        
+        local bg = Instance.new("Frame", ESP.Billboard)
+        bg.Size = UDim2.new(1, 0, 1, 0)
+        bg.BackgroundColor3 = THEME.Background
+        bg.BackgroundTransparency = 0.4
+        Instance.new("UICorner", bg).CornerRadius = UDim.new(0, 8)
+        
+        ESP.Stroke = Instance.new("UIStroke", bg)
+        ESP.Stroke.Thickness = 1.5
+        ESP.Stroke.Transparency = 0.5
+        
+        ESP.TextLabel.Size = UDim2.new(1, 0, 1, 0)
+        ESP.TextLabel.BackgroundTransparency = 1
+        ESP.TextLabel.Font = Enum.Font.FredokaOne
+        ESP.TextLabel.RichText = true
+        ESP.TextLabel.TextSize = 10
+        ESP.TextLabel.TextWrapped = true
+        ESP.TextLabel.Parent = bg
+        
+        ESP.Highlight.Parent = targetGui
+        ESP.Billboard.Parent = targetGui
+    end)
+end
+
+function ESP.Update(targetModel, targetPart, title, mps)
+    if targetModel and targetPart then
+        ESP.Highlight.Adornee = targetModel
+        ESP.Billboard.Adornee = targetPart
+        ESP.TextLabel.Text = title .. " 👻\n<font size='9'>MPS: " .. mps .. "</font>"
+        ESP.Highlight.Enabled = true
+        ESP.Billboard.Enabled = true
+    else
+        ESP.Highlight.Enabled = false
+        ESP.Billboard.Enabled = false
+    end
+end
+
+ESP.Init()
+
+-- Cria ESP para os Jogadores ("Pessoas")
+local function CreatePlayerESP(otherPlayer)
+    if otherPlayer == player then return end
+    local folder = Instance.new("Folder")
+    folder.Name = otherPlayer.Name .. "_ESP"
+    folder.Parent = targetGui
+    
+    local hl = Instance.new("Highlight", folder)
+    hl.FillTransparency = 0.7
+    hl.OutlineTransparency = 0.1
+    
+    local bb = Instance.new("BillboardGui", folder)
+    bb.Size = UDim2.fromOffset(100, 25)
+    bb.AlwaysOnTop = true
+    bb.StudsOffset = Vector3.new(0, 4, 0)
+    
+    local txt = Instance.new("TextLabel", bb)
+    txt.Size = UDim2.new(1, 0, 1, 0)
+    txt.BackgroundTransparency = 1
+    txt.Font = Enum.Font.GothamBold
+    txt.TextSize = 12
+    txt.TextStrokeTransparency = 0
+    
+    PlayerESPs[otherPlayer] = { Folder = folder, Highlight = hl, Billboard = bb, Text = txt }
+end
+
+for _, v in ipairs(Players:GetPlayers()) do CreatePlayerESP(v) end
+Players.PlayerAdded:Connect(CreatePlayerESP)
+Players.PlayerRemoving:Connect(function(otherPlayer)
+    if PlayerESPs[otherPlayer] then
+        PlayerESPs[otherPlayer].Folder:Destroy()
+        PlayerESPs[otherPlayer] = nil
+    end
+end)
+
+-- Loop para Highlight Laranja nos LaunchPads (Base)
+task.spawn(function()
+    while task.wait(2) do
+        pcall(function()
+            local plots = Workspace:FindFirstChild("Plots")
+            if plots then
+                for _, plot in ipairs(plots:GetChildren()) do
+                    local builds = plot:FindFirstChild("Builds")
+                    if builds then
+                        local pad = builds:FindFirstChild("LaunchPad")
+                        if pad and not pad:FindFirstChild("PadAura") then
+                            local hl = Instance.new("Highlight")
+                            hl.Name = "PadAura"
+                            hl.FillTransparency = 0.6
+                            hl.OutlineTransparency = 0.1
+                            hl.Parent = pad
+                        end
+                    end
+                end
+            end
+        end)
+    end
+end)
+
+-- ========================================================================
+-- RENDER LOOP: SISTEMA DE CORES PERSISTENTE (VERMELHO < 50m | AZUL > 50m)
+-- ========================================================================
+RunService.RenderStepped:Connect(function()
+    pcall(function()
+        local char = player.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+
+        local function GetColor(targetPos)
+            local dist = (hrp.Position - targetPos).Magnitude
+            return dist <= 50 and COLOR_NEAR or COLOR_FAR, dist
+        end
+
+        -- 1. Atualizar ESP do Pet/Modelo Focado
+        if ESP.Billboard.Adornee then
+            local color = GetColor(ESP.Billboard.Adornee.Position)
+            ESP.Highlight.FillColor = color
+            ESP.Highlight.OutlineColor = color
+            if ESP.Stroke then ESP.Stroke.Color = color end
+            ESP.TextLabel.TextColor3 = color
+        end
+
+        -- 2. Atualizar ESP dos Jogadores (Pessoas)
+        for otherPlayer, espData in pairs(PlayerESPs) do
+            local char2 = otherPlayer.Character
+            local hrp2 = char2 and char2:FindFirstChild("HumanoidRootPart")
+            if hrp2 then
+                local color, dist = GetColor(hrp2.Position)
+                espData.Highlight.Adornee = char2
+                espData.Billboard.Adornee = hrp2
+                espData.Highlight.FillColor = color
+                espData.Highlight.OutlineColor = color
+                espData.Text.TextColor3 = color
+                espData.Text.Text = string.format("%s\n[%.1fm]", otherPlayer.Name, dist)
+                
+                espData.Highlight.Enabled = true
+                espData.Billboard.Enabled = true
+            else
+                espData.Highlight.Enabled = false
+                espData.Billboard.Enabled = false
+            end
+        end
+
+        -- 3. Atualizar Beam (Bion)
+        local beam = Workspace:FindFirstChild("MyBaseLaunchPadBeam")
+        if beam and beam.Attachment1 and beam.Attachment1.Parent then
+            local padPart = beam.Attachment1.Parent
+            if padPart:IsA("BasePart") then
+                local color = GetColor(padPart.Position)
+                beam.Color = ColorSequence.new(color)
+            end
+        end
+
+        -- 4. Atualizar Auras (Highlights) dos Launchpads
+        local plots = Workspace:FindFirstChild("Plots")
+        if plots then
+            for _, plot in ipairs(plots:GetChildren()) do
+                local builds = plot:FindFirstChild("Builds")
+                if builds then
+                    local pad = builds:FindFirstChild("LaunchPad")
+                    if pad and pad.PrimaryPart then
+                        local hl = pad:FindFirstChild("PadAura")
+                        if hl then
+                            local color = GetColor(pad.PrimaryPart.Position)
+                            hl.FillColor = color
+                            hl.OutlineColor = color
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end)
+
+-- ========================================================================
+-- CORE DE TELEPORTE E SCAN
+-- ========================================================================
+local Utils = {}
+function Utils.ParseNumber(texto)
+    if type(texto) ~= "string" then return 0 end
+    texto = string.upper(string.gsub(texto, ",", ""))
+    local numStr, sufixo = string.match(texto, "(%d+%.?%d*)%s*([A-Z]*)")
+    local num = tonumber(numStr) or 0
+    local multiplicadores = {K = 1e3, M = 1e6, B = 1e9, T = 1e12, QA = 1e15, QI = 1e18, SX = 1e21, SP = 1e24, OC = 1e27, NO = 1e30, DC = 1e33}
+    if multiplicadores[sufixo] then num = num * multiplicadores[sufixo] end
+    return num
+end
+
+local Core = { BestPet = nil, IsTeleporting = false }
+
+function Core.Scan()
+    task.spawn(function()
+        while task.wait(0.8) do
+            pcall(function()
+                local runtimePets = Workspace:FindFirstChild("RuntimePets") or Workspace
+                local melhor, maiorValor = nil, -1
+                
+                for _, tag in ipairs(runtimePets:GetDescendants()) do
+                    if tag:IsA("BillboardGui") and (tag.Name == "ItemNameTag" or tag.Name == "PetTag") then
+                        local labelMPS = tag:FindFirstChild("MPS")
+                        local labelTitle = tag:FindFirstChild("TITLE") or tag:FindFirstChild("Title") or tag:FindFirstChild("Name")
+                        
+                        if labelMPS then
+                            local txtMPS = labelMPS.ContentText ~= "" and labelMPS.ContentText or labelMPS.Text
+                            local txtTitle = "Pet"
+                            if labelTitle then txtTitle = labelTitle.ContentText ~= "" and labelTitle.ContentText or labelTitle.Text end
+                            local valor = Utils.ParseNumber(txtMPS)
+                            
+                            local targetModel = tag:FindFirstAncestorOfClass("Model")
+                            if targetModel then
+                                local part = targetModel.PrimaryPart or targetModel:FindFirstChildWhichIsA("BasePart")
+                                local prompt = targetModel:FindFirstChildWhichIsA("ProximityPrompt", true)
+                                
+                                if part and prompt and valor > maiorValor then
+                                    maiorValor = valor
+                                    prompt.RequiresLineOfSight = false
+                                    prompt.MaxActivationDistance = 50
+                                    melhor = {model = targetModel, part = part, prompt = prompt, mpsText = txtMPS, titleText = txtTitle, rawValue = valor}
+                                end
+                            end
+                        end
+                    end
+                end
+                Core.BestPet = melhor
+                if melhor then ESP.Update(melhor.model, melhor.part, melhor.titleText, melhor.mpsText)
+                else ESP.Update(nil, nil, "", "") end
+            end)
+        end
+    end)
+end
+
+function Core.TeleportAndClaim()
+    if Core.IsTeleporting or not Core.BestPet then return end
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    
+    if hrp and Core.BestPet.prompt and Core.BestPet.part then
+        Core.IsTeleporting = true
+        local originalCFrame = hrp.CFrame -- Salva a posição original de onde você deu o TP
+        local prompt = Core.BestPet.prompt
+        
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.CFrame = Core.BestPet.part.CFrame + Vector3.new(0, 3, 0) -- TP para o melhor pet
+        task.wait(0.1)
+        
+        -- Ativa o prompt
+        prompt.HoldDuration = 0
+        for _ = 1, 3 do
+            if fireproximityprompt then fireproximityprompt(prompt, 1) else prompt:InputHoldBegin() prompt:InputHoldEnd() end
+            task.wait(0.05)
+        end
+        
+        -- Espera exatamente 0.7 segundos após ativar o prompt
+        task.wait(0.7) 
+        
+        -- Volta para a posição original de onde você deu o TP
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.CFrame = originalCFrame
+        Core.IsTeleporting = false
+    end
+end
+
+Core.Scan()
+
+-- ========================================================================
+-- INTERFACE GRÁFICA (MINIMIZADOR AJUSTADO PARA CIMA)
+-- ========================================================================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = GUI_NAME
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = targetGui
+
+local MainFrame = Instance.new("Frame", ScreenGui)
+MainFrame.Size = UDim2.new(0, 210, 0, 205)
+MainFrame.Position = UDim2.new(0.5, -105, 0.5, -102.5) 
+MainFrame.BackgroundColor3 = THEME.Background
+MainFrame.BackgroundTransparency = 0.05
+MainFrame.Active = true
+MainFrame.Draggable = true
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 14)
+
+local UIStroke = Instance.new("UIStroke", MainFrame)
+UIStroke.Thickness = 2.5
+UIStroke.Transparency = 0.2
+UIStroke.Color = Color3.new(1, 1, 1)
+
+local StrokeGradient = Instance.new("UIGradient", UIStroke)
+StrokeGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(0, 255, 120)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(0, 100, 255)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 255, 120))
+})
+
+RunService.RenderStepped:Connect(function() StrokeGradient.Rotation = (StrokeGradient.Rotation + 2) % 360 end)
+
+local Header = Instance.new("TextLabel", MainFrame)
+Header.Size = UDim2.new(1, 0, 0, 35)
+Header.BackgroundTransparency = 1
+Header.Text = "👻 PHANTOM HUB"
+Header.TextColor3 = THEME.Accent
+Header.Font = Enum.Font.FredokaOne
+Header.TextSize = 16
+
+local Content = Instance.new("Frame", MainFrame)
+Content.Size = UDim2.new(1, -20, 1, -45)
+Content.Position = UDim2.new(0, 10, 0, 40)
+Content.BackgroundTransparency = 1
+
+local UIList = Instance.new("UIListLayout", Content)
+UIList.SortOrder = Enum.SortOrder.LayoutOrder
+UIList.Padding = UDim.new(0, 8)
+UIList.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+local function CreateGhostButton(text, color, parent, callback)
+    local btn = Instance.new("TextButton", parent)
+    btn.Size = UDim2.new(1, 0, 0, 36)
+    btn.BackgroundColor3 = THEME.Surface
+    btn.BackgroundTransparency = 0.3
+    btn.Text = text
+    btn.TextColor3 = color
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 12
+    btn.AutoButtonColor = false
+    
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+    local btnStroke = Instance.new("UIStroke", btn)
+    btnStroke.Color = color
+    btnStroke.Transparency = 0.6
+    
+    btn.MouseButton1Down:Connect(function() TweenService:Create(btn, TweenInfo.new(0.1, Enum.EasingStyle.Sine), {Size = UDim2.new(1, -6, 0, 32), BackgroundTransparency = 0}):Play() end)
+    btn.MouseButton1Up:Connect(function() TweenService:Create(btn, TweenInfo.new(0.3, Enum.EasingStyle.Back), {Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 0.3}):Play() end)
+    btn.MouseLeave:Connect(function() TweenService:Create(btn, TweenInfo.new(0.3, Enum.EasingStyle.Back), {Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 0.3}):Play() end)
+    btn.MouseButton1Click:Connect(function() callback(btn) end)
+    return btn
+end
+
+-- Botões Atualizados
+CreateGhostButton("👻 TP Best", THEME.Accent, Content, function() Core.TeleportAndClaim() end)
+
+CreateGhostButton("🏠 TP Bug voltar\n<font size='9' color='#aaaaaa'>Caso bugar volte aq</font>", Color3.fromRGB(255, 200, 100), Content, function(btn)
+    local pad = GetPlayerLaunchPad()
+    if pad and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+        player.Character.HumanoidRootPart.CFrame = pad.CFrame + Vector3.new(0, 4, 0)
+    else
+        local oldTxt = btn.Text
+        btn.Text = "❌ Plot não encontrado!"
+        task.delay(1.5, function() btn.Text = oldTxt end)
+    end
+end):FindFirstChildWhichIsA("TextLabel", true)
+
+CreateGhostButton("❌ Auto Sair", Color3.fromRGB(255, 100, 100), Content, function() player:Kick("Você desconectou pelo Phantom Hub.") end)
+
+local StatusLabel = Instance.new("TextLabel", Content)
+StatusLabel.Size = UDim2.new(1, 0, 0, 18)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.Text = "Procurando pets..."
+StatusLabel.TextColor3 = THEME.TextDim
+StatusLabel.Font = Enum.Font.GothamMedium
+StatusLabel.TextSize = 11
+
+local MinBtn = Instance.new("TextButton", MainFrame)
+MinBtn.Size = UDim2.new(0, 30, 0, 30)
+MinBtn.Position = UDim2.new(1, -35, 0, 3)
+MinBtn.BackgroundTransparency = 1
+MinBtn.Text = "-"
+MinBtn.TextColor3 = THEME.Accent
+MinBtn.Font = Enum.Font.FredokaOne
+MinBtn.TextSize = 18
+
+local isMinimized = false
+MinBtn.MouseButton1Click:Connect(function()
+    isMinimized = not isMinimized
+    if isMinimized then
+        TweenService:Create(MainFrame, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+            Size = UDim2.new(0, 210, 0, 40)
+        }):Play()
+        Content.Visible = false
+        MinBtn.Text = "+"
+    else
+        Content.Visible = true
+        TweenService:Create(MainFrame, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+            Size = UDim2.new(0, 210, 0, 205)
+        }):Play()
+        MinBtn.Text = "-"
+    end
+end)
+
+for _, btn in ipairs(Content:GetChildren()) do
+    if btn:IsA("TextButton") and btn.Text:match("<font") then btn.RichText = true end
+end
+
+task.spawn(function()
+    while task.wait(0.5) do
+        if Core.BestPet then StatusLabel.Text = "Melhor Pet: " .. Core.BestPet.mpsText else StatusLabel.Text = "Procurando pets..." end
+    end
+end)
