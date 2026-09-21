@@ -1,0 +1,2933 @@
+--[[
+	╔═══════════════════════════════════════════════════════════════╗
+	║   ANÔNIMO AI  ·  Assistente Gemini para Roblox (Luau)         ║
+	╚═══════════════════════════════════════════════════════════════╝
+
+	SETUP
+	  1) Pegue uma API Key gratis: https://aistudio.google.com/apikey
+	  2) Cole em CONFIG.API_KEY  -OU-  digite  /key SUA_CHAVE  no chat
+	     (a chave fica salva em AnonimoAI/settings.json do seu executor).
+	  3) Execute num executor com request/http_request + writefile/readfile.
+
+	RECURSOS
+	  - Modelo gemini-3.6-flash (troque com /modelo) + fallback automatico
+	  - Varios chats salvos em disco (drawer ☰), busca, renomear, apagar
+	  - Medidor de uso: req/min, req/dia, tokens e janela de contexto
+	  - Paleta de comandos (digite "/")   ·   /ajuda lista tudo
+	  - Modo Roblox (/roblox): a IA age no jogo via ferramentas
+	    ("coloque um NPC na minha frente", "muda pra noite", ...)
+	  - Visao (👁 / /ver): print da tela + varredura da cena a cada mensagem
+
+	OBSERVACOES HONESTAS
+	  - Tudo que a IA cria e local (client-side): so voce ve.
+	  - "Tempo real" = um snapshot a cada mensagem; a API do Gemini nao faz
+	    stream de video. O print usa CaptureService (se o executor liberar);
+	    se falhar, cai automaticamente para a varredura de cena por raycast.
+	  - O medidor de uso e uma estimativa local: o Google nao expoe a cota
+	    restante via API. Ajuste os limites com /limite.
+]]
+
+-- ═══════════════════════ SERVICOS ═══════════════════════
+local Players            = game:GetService("Players")
+local HttpService        = game:GetService("HttpService")
+local TweenService       = game:GetService("TweenService")
+local UserInputService   = game:GetService("UserInputService")
+local MarketplaceService = game:GetService("MarketplaceService")
+local RunService         = game:GetService("RunService")
+local Lighting           = game:GetService("Lighting")
+local Teams              = game:GetService("Teams")
+
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+local CaptureService, AssetService
+pcall(function() CaptureService = game:GetService("CaptureService") end)
+pcall(function() AssetService = game:GetService("AssetService") end)
+
+-- ═══════════════════════ CONFIGURACAO ═══════════════════════
+local CONFIG = {
+	APP_NAME          = "ANÔNIMO AI",
+	API_KEY           = "",                      -- opcional: cole sua chave aqui
+	MODEL             = "gemini-3.6-flash",
+	MODEL_FALLBACKS   = { "gemini-3.7-flash", "gemini-3.5-flash" }, -- usados se o modelo der 404
+	THINKING_LEVEL    = "low",                   -- minimal | low | medium | high  ("" = padrao do modelo)
+	MAX_OUTPUT_TOKENS = 8192,
+	MAX_CONTEXT_ITEMS = 40,                      -- itens de historico enviados por requisicao
+	CONTEXT_TTL       = 20,                      -- cache (s) do contexto do servidor
+	MAX_RETRIES       = 3,
+	MAX_TOOL_ROUNDS   = 6,
+	MAX_PLAYERS_IN_CTX = 40,
+
+	LIMIT_RPM         = 10,                      -- estimativas locais (ajuste com /limite)
+	LIMIT_RPD         = 250,
+	LIMIT_TOKENS_DAY  = 1000000,
+	CONTEXT_WINDOW    = 1048576,
+
+	VISION_WIDTH      = 448,                     -- largura do print enviado (px)
+	VISION_TIMEOUT    = 4,
+	HIDE_UI_ON_CAPTURE = true,                   -- esconde a janela por ~2 frames no print
+
+	DATA_FOLDER       = "AnonimoAI",
+	GUI_NAME          = "AnonimoAI_UI",
+	SPAWN_FOLDER      = "AnonimoAI_Spawns",
+	SAVE_DEBOUNCE     = 1.5,
+	RENDER_LIMIT      = 60,                      -- mensagens desenhadas ao abrir um chat
+}
+
+local ACCENTS = {
+	azul    = Color3.fromRGB(66, 103, 232),
+	roxo    = Color3.fromRGB(139, 92, 246),
+	verde   = Color3.fromRGB(34, 178, 110),
+	rosa    = Color3.fromRGB(236, 72, 153),
+	laranja = Color3.fromRGB(245, 133, 40),
+	ciano   = Color3.fromRGB(20, 184, 210),
+}
+
+local THEME = {
+	bg      = Color3.fromRGB(24, 24, 30),
+	panel   = Color3.fromRGB(44, 44, 54),
+	input   = Color3.fromRGB(16, 16, 21),
+	button  = Color3.fromRGB(70, 70, 84),
+	accent  = ACCENTS.azul,
+	text    = Color3.fromRGB(240, 240, 246),
+	subtext = Color3.fromRGB(150, 150, 166),
+	ok      = Color3.fromRGB(80, 200, 120),
+	warn    = Color3.fromRGB(245, 190, 80),
+	danger  = Color3.fromRGB(240, 100, 100),
+	codeBg  = Color3.fromRGB(12, 12, 16),
+	code    = Color3.fromRGB(171, 178, 191),
+}
+
+local SYN = {
+	keyword = "#C678DD", string = "#98C379", number = "#D19A66",
+	comment = "#7F848E", builtin = "#E5C07B", func = "#61AFEF", inline = "#F5B971",
+}
+
+-- ═══════════════════════ HELPERS ═══════════════════════
+local function new(class, props, parent)
+	local inst = Instance.new(class)
+	for k, v in pairs(props or {}) do inst[k] = v end
+	if parent then inst.Parent = parent end
+	return inst
+end
+
+local function corner(inst, radius)
+	return new("UICorner", { CornerRadius = UDim.new(0, radius) }, inst)
+end
+
+local function stroke(inst, color, transparency, thickness)
+	return new("UIStroke", {
+		Color = color or Color3.new(1, 1, 1),
+		Transparency = transparency or 0.88,
+		Thickness = thickness or 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	}, inst)
+end
+
+local function padding(inst, top, right, bottom, left)
+	return new("UIPadding", {
+		PaddingTop = UDim.new(0, top), PaddingRight = UDim.new(0, right),
+		PaddingBottom = UDim.new(0, bottom), PaddingLeft = UDim.new(0, left),
+	}, inst)
+end
+
+local function listLayout(parent, dir, pad, order)
+	return new("UIListLayout", {
+		FillDirection = dir or Enum.FillDirection.Vertical,
+		SortOrder = order or Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, pad or 0),
+	}, parent)
+end
+
+local function tween(inst, duration, props, style, dir)
+	local tw = TweenService:Create(inst, TweenInfo.new(duration, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out), props)
+	tw:Play()
+	return tw
+end
+
+local function trim(s)
+	return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function escapeRich(s)
+	s = s:gsub("&", "&amp;")
+	s = s:gsub("<", "&lt;")
+	s = s:gsub(">", "&gt;")
+	s = s:gsub('"', "&quot;")
+	s = s:gsub("'", "&apos;")
+	return s
+end
+
+local function splitLong(s, maxLen)
+	if #s <= maxLen then return { s } end
+	local out, cur = {}, ""
+	for line in (s .. "\n"):gmatch("(.-)\n") do
+		if #cur + #line + 1 > maxLen and cur ~= "" then
+			out[#out + 1] = cur
+			cur = ""
+		end
+		cur = (cur == "") and line or (cur .. "\n" .. line)
+	end
+	if cur ~= "" then out[#out + 1] = cur end
+	return out
+end
+
+local function fmtNum(n)
+	n = tonumber(n) or 0
+	if n >= 1000000 then return ("%.1fM"):format(n / 1000000) end
+	if n >= 1000 then return ("%.1fk"):format(n / 1000) end
+	return tostring(math.floor(n))
+end
+
+local function shorten(s, n)
+	s = trim((s:gsub("%s+", " ")))
+	if #s <= n then return s end
+	return s:sub(1, n - 1) .. "…"
+end
+
+local function fmtDate(ts)
+	if not ts then return "" end
+	return os.date("%d/%m %H:%M", ts)
+end
+
+local function newId()
+	return "c" .. tostring(os.time()) .. tostring(math.random(100, 999))
+end
+
+-- ═══════════════════════ AMBIENTE / EXECUTOR ═══════════════════════
+local ENV = (getgenv and getgenv()) or _G
+if ENV.__AnonimoAI_Cleanup then pcall(ENV.__AnonimoAI_Cleanup) end
+
+local connections = {}
+local function bind(signal, fn)
+	local c = signal:Connect(fn)
+	connections[#connections + 1] = c
+	return c
+end
+
+local httpRequest = (syn and syn.request) or (http and http.request) or http_request or request or (fluxus and fluxus.request)
+local clipboardFn = setclipboard or toclipboard or set_clipboard or (Clipboard and Clipboard.set)
+local FS_OK = (writefile and readfile and isfile and isfolder and makefolder) and true or false
+
+local function copyToClipboard(text)
+	if not clipboardFn then
+		warn("[ANÔNIMO AI] Clipboard indisponivel neste executor.")
+		return false
+	end
+	return (pcall(clipboardFn, text))
+end
+
+-- ═══════════════════════ ARMAZENAMENTO (tudo salvo) ═══════════════════════
+local ROOT = CONFIG.DATA_FOLDER
+local PATH = {
+	settings = ROOT .. "/settings.json",
+	usage    = ROOT .. "/usage.json",
+	index    = ROOT .. "/index.json",
+	chats    = ROOT .. "/chats",
+}
+
+local function ensureFolders()
+	if not FS_OK then return end
+	pcall(function()
+		if not isfolder(ROOT) then makefolder(ROOT) end
+		if not isfolder(PATH.chats) then makefolder(PATH.chats) end
+	end)
+end
+
+local function jsonWrite(path, tbl)
+	if not FS_OK then return false end
+	local ok, s = pcall(HttpService.JSONEncode, HttpService, tbl)
+	if not ok then return false end
+	return (pcall(writefile, path, s))
+end
+
+local function jsonRead(path)
+	if not FS_OK then return nil end
+	local okE, exists = pcall(isfile, path)
+	if not (okE and exists) then return nil end
+	local okR, s = pcall(readfile, path)
+	if not okR or type(s) ~= "string" then return nil end
+	local okD, t = pcall(HttpService.JSONDecode, HttpService, s)
+	if okD then return t end
+	return nil
+end
+
+local Settings = {
+	apiKey   = "",
+	model    = CONFIG.MODEL,
+	thinking = CONFIG.THINKING_LEVEL,
+	accent   = "azul",
+	roblox   = false,
+	vision   = false,
+	autoRun  = false,
+	rpm      = CONFIG.LIMIT_RPM,
+	rpd      = CONFIG.LIMIT_RPD,
+	tpd      = CONFIG.LIMIT_TOKENS_DAY,
+	current  = false,
+}
+local Usage = { day = "", reqs = 0, tokens = 0, promptTokens = 0, outTokens = 0 }
+local Index = {}
+local Chats = {}
+local stamps = {}
+
+local dirty, saveScheduled = {}, false
+local flushSaves
+
+local function markDirty(key)
+	dirty[key] = true
+	if not saveScheduled then
+		saveScheduled = true
+		task.delay(CONFIG.SAVE_DEBOUNCE, function() flushSaves() end)
+	end
+end
+
+flushSaves = function()
+	saveScheduled = false
+	local keys = {}
+	for k in pairs(dirty) do keys[#keys + 1] = k end
+	table.clear(dirty)
+	for _, k in ipairs(keys) do
+		if k == "settings" then
+			jsonWrite(PATH.settings, Settings)
+		elseif k == "usage" then
+			jsonWrite(PATH.usage, Usage)
+		elseif k == "index" then
+			jsonWrite(PATH.index, Index)
+		elseif k:sub(1, 5) == "chat:" then
+			local id = k:sub(6)
+			if Chats[id] then jsonWrite(PATH.chats .. "/" .. id .. ".json", Chats[id]) end
+		end
+	end
+end
+
+local function loadPersisted()
+	ensureFolders()
+	local s = jsonRead(PATH.settings)
+	if type(s) == "table" then
+		for k, v in pairs(s) do
+			if Settings[k] ~= nil and type(v) == type(Settings[k]) then Settings[k] = v end
+		end
+	end
+	if CONFIG.API_KEY ~= "" then Settings.apiKey = CONFIG.API_KEY end
+	local u = jsonRead(PATH.usage)
+	if type(u) == "table" then
+		for k in pairs(Usage) do
+			if u[k] ~= nil and type(u[k]) == type(Usage[k]) then Usage[k] = u[k] end
+		end
+	end
+	local idx = jsonRead(PATH.index)
+	if type(idx) == "table" then Index = idx end
+end
+
+-- ═══════════════════════ USO / LIMITES ═══════════════════════
+local function today() return os.date("%Y-%m-%d") end
+
+local function rollDay()
+	if Usage.day ~= today() then
+		Usage.day = today()
+		Usage.reqs, Usage.tokens, Usage.promptTokens, Usage.outTokens = 0, 0, 0, 0
+	end
+end
+
+local function rpmNow()
+	local now, i = os.clock(), 1
+	while i <= #stamps do
+		if now - stamps[i] >= 60 then table.remove(stamps, i) else i = i + 1 end
+	end
+	return #stamps
+end
+
+local function waitForSlot(onStatus)
+	local waited = 0
+	while rpmNow() >= Settings.rpm and waited < 65 do
+		local remain = math.max(1, math.ceil(60 - (os.clock() - stamps[1])))
+		if onStatus then onStatus(("Aguardando limite por minuto (%ds)"):format(remain)) end
+		task.wait(1)
+		waited = waited + 1
+	end
+end
+
+local function noteRequest()
+	rollDay()
+	stamps[#stamps + 1] = os.clock()
+	Usage.reqs = Usage.reqs + 1
+	markDirty("usage")
+end
+
+local function noteTokens(meta)
+	if type(meta) ~= "table" then return 0 end
+	local p = tonumber(meta.promptTokenCount) or 0
+	local c = (tonumber(meta.candidatesTokenCount) or 0) + (tonumber(meta.thoughtsTokenCount) or 0)
+	local total = tonumber(meta.totalTokenCount) or (p + c)
+	Usage.promptTokens = Usage.promptTokens + p
+	Usage.outTokens = Usage.outTokens + c
+	Usage.tokens = Usage.tokens + total
+	markDirty("usage")
+	return p
+end
+
+-- ═══════════════════════ CONTEXTO DO SERVIDOR ═══════════════════════
+local Context = { text = "", stamp = 0, building = false, gameName = nil }
+
+local function getGameName()
+	if Context.gameName then return Context.gameName end
+	local name = game.Name
+	if game.PlaceId ~= 0 then
+		local ok, info = pcall(MarketplaceService.GetProductInfo, MarketplaceService, game.PlaceId)
+		if ok and type(info) == "table" and info.Name then name = info.Name end
+	end
+	Context.gameName = name
+	return name
+end
+
+local function collectServerContext()
+	local L = {}
+	local function add(s) L[#L + 1] = s end
+
+	add("Jogo: " .. getGameName())
+	add("PlaceId: " .. tostring(game.PlaceId) .. " | GameId: " .. tostring(game.GameId))
+	add("JobId: " .. (game.JobId ~= "" and game.JobId or "(Studio/local)"))
+	add(("Tempo de servidor: %.1f min"):format(workspace.DistributedGameTime / 60))
+
+	local list = Players:GetPlayers()
+	add(("Jogadores online: %d/%d"):format(#list, Players.MaxPlayers))
+	for i, p in ipairs(list) do
+		if i > CONFIG.MAX_PLAYERS_IN_CTX then
+			add(("  ... e mais %d jogadores"):format(#list - i + 1))
+			break
+		end
+		local team = p.Team and p.Team.Name or "Sem equipe"
+		local me = (p == LocalPlayer) and " (voce)" or ""
+		add(("  %d. %s (@%s) | equipe: %s%s"):format(i, p.DisplayName, p.Name, team, me))
+	end
+
+	local okT, teamList = pcall(function() return Teams:GetTeams() end)
+	if okT and #teamList > 0 then
+		local t = {}
+		for _, team in ipairs(teamList) do
+			t[#t + 1] = ("%s (%d)"):format(team.Name, #team:GetPlayers())
+		end
+		add("Equipes: " .. table.concat(t, ", "))
+	end
+
+	local char = LocalPlayer.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if root then
+		add(("Posicao do jogador local: %.0f, %.0f, %.0f"):format(root.Position.X, root.Position.Y, root.Position.Z))
+	end
+
+	local total, classes = 0, {}
+	for _, inst in ipairs(workspace:GetDescendants()) do
+		total = total + 1
+		local cn = inst.ClassName
+		classes[cn] = (classes[cn] or 0) + 1
+		if total % 20000 == 0 then task.wait() end
+	end
+	add("Instancias no Workspace: " .. total)
+	add("Filhos diretos do Workspace: " .. #workspace:GetChildren())
+
+	local arr = {}
+	for cn, n in pairs(classes) do arr[#arr + 1] = { cn, n } end
+	table.sort(arr, function(a, b) return a[2] > b[2] end)
+	local top = {}
+	for i = 1, math.min(8, #arr) do top[i] = arr[i][1] .. "=" .. arr[i][2] end
+	if #top > 0 then add("Classes mais comuns: " .. table.concat(top, ", ")) end
+	add("Gravidade: " .. tostring(workspace.Gravity) .. " | ClockTime: " .. ("%.1f"):format(Lighting.ClockTime))
+	return table.concat(L, "\n")
+end
+
+local function buildServerContext(force)
+	if not force and Context.text ~= "" and (os.clock() - Context.stamp) < CONFIG.CONTEXT_TTL then
+		return Context.text
+	end
+	if Context.building then
+		while Context.building do task.wait() end
+		return Context.text
+	end
+	Context.building = true
+	local ok, result = pcall(collectServerContext)
+	Context.building = false
+	if ok then
+		Context.text, Context.stamp = result, os.clock()
+	elseif Context.text == "" then
+		Context.text = "(falha ao coletar contexto: " .. tostring(result) .. ")"
+	end
+	return Context.text
+end
+
+-- ═══════════════════════ VISAO (print + varredura de cena) ═══════════════════════
+local Vision = { shotFails = 0, shotDisabled = false, lastMethod = "nenhum" }
+local guiRef -- definido quando a GUI existir (para esconder no print)
+
+local function regionName(c, r, cols, rows)
+	local h = (c <= cols / 3) and "esquerda" or ((c <= cols * 2 / 3) and "centro" or "direita")
+	local v = (r <= rows / 3) and "cima" or ((r <= rows * 2 / 3) and "meio" or "baixo")
+	return v .. "/" .. h
+end
+
+local function sceneScan()
+	local cam = workspace.CurrentCamera
+	if not cam then return "(sem camera)" end
+	local L = {}
+	local function add(s) L[#L + 1] = s end
+	local cf = cam.CFrame
+	local look = cf.LookVector
+	add(("Camera: pos (%.0f, %.0f, %.0f) | direcao (%.2f, %.2f, %.2f) | FOV %.0f"):format(
+		cf.Position.X, cf.Position.Y, cf.Position.Z, look.X, look.Y, look.Z, cam.FieldOfView))
+	add(("Hora do jogo: %.1f | Gravidade: %.1f"):format(Lighting.ClockTime, workspace.Gravity))
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local ignore = {}
+	if LocalPlayer.Character then ignore[#ignore + 1] = LocalPlayer.Character end
+	params.FilterDescendantsInstances = ignore
+
+	local vp = cam.ViewportSize
+	local cols, rows = 9, 5
+	local seen, order, sky = {}, {}, 0
+	for r = 1, rows do
+		for c = 1, cols do
+			local ray = cam:ViewportPointToRay(vp.X * (c - 0.5) / cols, vp.Y * (r - 0.5) / rows)
+			local res = workspace:Raycast(ray.Origin, ray.Direction * 400, params)
+			if res and res.Instance then
+				local inst = res.Instance
+				local model = inst:FindFirstAncestorOfClass("Model")
+				local label = (model and model ~= workspace) and model.Name or inst.Name
+				local e = seen[label]
+				if not e then
+					e = { n = 0, dist = 0, class = inst.ClassName, mat = tostring(res.Material), regions = {} }
+					seen[label] = e
+					order[#order + 1] = label
+				end
+				e.n = e.n + 1
+				e.dist = e.dist + res.Distance
+				e.regions[regionName(c, r, cols, rows)] = true
+			else
+				sky = sky + 1
+			end
+		end
+	end
+	table.sort(order, function(a, b) return seen[a].n > seen[b].n end)
+	add(("Grade de visao %dx%d: %d celulas de ceu/vazio"):format(cols, rows, sky))
+	for i = 1, math.min(12, #order) do
+		local e = seen[order[i]]
+		local regs = {}
+		for k in pairs(e.regions) do regs[#regs + 1] = k end
+		table.sort(regs)
+		add(("  - %s [%s, %s] %d celulas, ~%.0f studs, em: %s"):format(
+			order[i], e.class, e.mat:gsub("Enum.Material.", ""), e.n, e.dist / e.n, table.concat(regs, ", ")))
+	end
+
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LocalPlayer and p.Character then
+			local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+			if hrp then
+				local pt, onScreen = cam:WorldToViewportPoint(hrp.Position)
+				if onScreen and pt.Z > 0 then
+					add(("Jogador na tela: %s a %.0f studs"):format(p.DisplayName, (hrp.Position - cf.Position).Magnitude))
+				end
+			end
+		end
+	end
+
+	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if pg then
+		local texts, n = {}, 0
+		for _, g in ipairs(pg:GetDescendants()) do
+			if n >= 20 then break end
+			if (g:IsA("TextLabel") or g:IsA("TextButton")) and g.Visible and g.Text ~= "" and #g.Text < 100 and g.TextTransparency < 1 then
+				local sg = g:FindFirstAncestorOfClass("ScreenGui")
+				if sg and sg.Enabled and sg.Name ~= CONFIG.GUI_NAME then
+					texts[#texts + 1] = shorten(g.Text, 60)
+					n = n + 1
+				end
+			end
+		end
+		if #texts > 0 then add("Textos de interface visiveis: " .. table.concat(texts, " | ")) end
+	end
+	return table.concat(L, "\n")
+end
+
+-- ---- PNG (deflate "stored") + Base64, sem dependencias ----
+local CRC_TABLE
+local function crcTable()
+	if CRC_TABLE then return CRC_TABLE end
+	local t = {}
+	for i = 0, 255 do
+		local c = i
+		for _ = 1, 8 do
+			if bit32.band(c, 1) == 1 then
+				c = bit32.bxor(0xEDB88320, bit32.rshift(c, 1))
+			else
+				c = bit32.rshift(c, 1)
+			end
+		end
+		t[i] = c
+	end
+	CRC_TABLE = t
+	return t
+end
+
+local lastYield = os.clock()
+local function maybeYield()
+	if os.clock() - lastYield > 0.006 then
+		task.wait()
+		lastYield = os.clock()
+	end
+end
+
+local function crc32(buf, from, to)
+	local t = crcTable()
+	local c = 0xFFFFFFFF
+	for i = from, to - 1 do
+		c = bit32.bxor(t[bit32.band(bit32.bxor(c, buffer.readu8(buf, i)), 0xFF)], bit32.rshift(c, 8))
+		if i % 16384 == 0 then maybeYield() end
+	end
+	return bit32.bxor(c, 0xFFFFFFFF)
+end
+
+local function writeU32BE(buf, off, v)
+	buffer.writeu8(buf, off, bit32.band(bit32.rshift(v, 24), 255))
+	buffer.writeu8(buf, off + 1, bit32.band(bit32.rshift(v, 16), 255))
+	buffer.writeu8(buf, off + 2, bit32.band(bit32.rshift(v, 8), 255))
+	buffer.writeu8(buf, off + 3, bit32.band(v, 255))
+end
+
+-- raw = buffer com h linhas de (1 byte de filtro=0 + w*3 bytes RGB)
+local function encodePNG(raw, w, h)
+	local rawLen = buffer.len(raw)
+	local nBlocks = math.ceil(rawLen / 65535)
+	local zLen = 2 + rawLen + nBlocks * 5 + 4
+	local out = buffer.create(8 + 25 + (12 + zLen) + 12)
+	local sig = { 137, 80, 78, 71, 13, 10, 26, 10 }
+	for i = 1, 8 do buffer.writeu8(out, i - 1, sig[i]) end
+	local pos = 8
+
+	writeU32BE(out, pos, 13); pos = pos + 4
+	local typeStart = pos
+	buffer.writestring(out, pos, "IHDR"); pos = pos + 4
+	writeU32BE(out, pos, w); writeU32BE(out, pos + 4, h); pos = pos + 8
+	buffer.writeu8(out, pos, 8)      -- profundidade
+	buffer.writeu8(out, pos + 1, 2)  -- RGB
+	buffer.writeu8(out, pos + 2, 0)
+	buffer.writeu8(out, pos + 3, 0)
+	buffer.writeu8(out, pos + 4, 0)
+	pos = pos + 5
+	writeU32BE(out, pos, crc32(out, typeStart, pos)); pos = pos + 4
+
+	writeU32BE(out, pos, zLen); pos = pos + 4
+	typeStart = pos
+	buffer.writestring(out, pos, "IDAT"); pos = pos + 4
+	buffer.writeu8(out, pos, 0x78)
+	buffer.writeu8(out, pos + 1, 0x01)
+	pos = pos + 2
+	local a, b, offset = 1, 0, 0
+	while offset < rawLen do
+		local n = math.min(65535, rawLen - offset)
+		local nn = bit32.band(bit32.bnot(n), 0xFFFF)
+		buffer.writeu8(out, pos, (offset + n >= rawLen) and 1 or 0)
+		buffer.writeu8(out, pos + 1, bit32.band(n, 255))
+		buffer.writeu8(out, pos + 2, bit32.rshift(n, 8))
+		buffer.writeu8(out, pos + 3, bit32.band(nn, 255))
+		buffer.writeu8(out, pos + 4, bit32.rshift(nn, 8))
+		pos = pos + 5
+		buffer.copy(out, pos, raw, offset, n)
+		for i = offset, offset + n - 1 do
+			a = (a + buffer.readu8(raw, i)) % 65521
+			b = (b + a) % 65521
+			if i % 16384 == 0 then maybeYield() end
+		end
+		pos = pos + n
+		offset = offset + n
+	end
+	writeU32BE(out, pos, b * 65536 + a); pos = pos + 4
+	writeU32BE(out, pos, crc32(out, typeStart, pos)); pos = pos + 4
+
+	writeU32BE(out, pos, 0); pos = pos + 4
+	typeStart = pos
+	buffer.writestring(out, pos, "IEND"); pos = pos + 4
+	writeU32BE(out, pos, crc32(out, typeStart, pos))
+	return out
+end
+
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local B64BYTES = {}
+for i = 1, 64 do B64BYTES[i - 1] = B64:byte(i) end
+
+local function base64Encode(buf)
+	local len = buffer.len(buf)
+	local out = buffer.create(math.ceil(len / 3) * 4)
+	local o = 0
+	for i = 0, len - 1, 3 do
+		local b1 = buffer.readu8(buf, i)
+		local b2 = (i + 1 < len) and buffer.readu8(buf, i + 1) or 0
+		local b3 = (i + 2 < len) and buffer.readu8(buf, i + 2) or 0
+		local n = b1 * 65536 + b2 * 256 + b3
+		buffer.writeu8(out, o, B64BYTES[bit32.rshift(n, 18)])
+		buffer.writeu8(out, o + 1, B64BYTES[bit32.band(bit32.rshift(n, 12), 63)])
+		buffer.writeu8(out, o + 2, (i + 1 < len) and B64BYTES[bit32.band(bit32.rshift(n, 6), 63)] or 61)
+		buffer.writeu8(out, o + 3, (i + 2 < len) and B64BYTES[bit32.band(n, 63)] or 61)
+		o = o + 4
+		if i % 12288 == 0 then maybeYield() end
+	end
+	return buffer.tostring(out)
+end
+
+-- Captura a tela via CaptureService -> EditableImage -> PNG base64
+local function captureScreenshot()
+	if not CaptureService or not AssetService then return nil, "CaptureService/AssetService indisponivel" end
+	local contentId, done = nil, false
+	local hidden = false
+	if CONFIG.HIDE_UI_ON_CAPTURE and guiRef then
+		guiRef.Enabled = false
+		hidden = true
+		RunService.RenderStepped:Wait()
+	end
+	local okCall, errCall = pcall(function()
+		CaptureService:CaptureScreenshot(function(id)
+			contentId, done = id, true
+		end)
+	end)
+	local t0 = os.clock()
+	while okCall and not done and os.clock() - t0 < CONFIG.VISION_TIMEOUT do task.wait() end
+	if hidden then guiRef.Enabled = true end
+	if not okCall then return nil, "CaptureScreenshot falhou: " .. tostring(errCall) end
+	if not contentId then return nil, "timeout ao capturar a tela" end
+
+	local okImg, img = pcall(function()
+		local okA, r = pcall(function() return AssetService:CreateEditableImageAsync(Content.fromUri(contentId)) end)
+		if okA then return r end
+		return AssetService:CreateEditableImageAsync(contentId)
+	end)
+	if not okImg or not img then return nil, "EditableImage indisponivel: " .. tostring(img) end
+
+	local okRun, b64, w, h = pcall(function()
+		local size = img.Size
+		local tw = math.min(CONFIG.VISION_WIDTH, size.X)
+		local th = math.max(1, math.floor(size.Y * tw / size.X))
+		pcall(function() img:Resize(Vector2.new(tw, th)) end)
+		local s2 = img.Size
+		local sw, sh = s2.X, s2.Y
+		if sw > tw then
+			-- Resize indisponivel: amostragem por vizinho mais proximo
+			sw, sh = s2.X, s2.Y
+		else
+			tw, th = sw, sh
+		end
+		local pixels = img:ReadPixelsBuffer(Vector2.new(0, 0), s2)
+		local stride = 1 + tw * 3
+		local raw = buffer.create(th * stride)
+		for y = 0, th - 1 do
+			local sy = math.min(sh - 1, math.floor(y * sh / th))
+			local rowBase = y * stride
+			buffer.writeu8(raw, rowBase, 0)
+			for x = 0, tw - 1 do
+				local sx = math.min(sw - 1, math.floor(x * sw / tw))
+				local si = (sy * sw + sx) * 4
+				local di = rowBase + 1 + x * 3
+				buffer.writeu8(raw, di, buffer.readu8(pixels, si))
+				buffer.writeu8(raw, di + 1, buffer.readu8(pixels, si + 1))
+				buffer.writeu8(raw, di + 2, buffer.readu8(pixels, si + 2))
+			end
+			if y % 8 == 0 then maybeYield() end
+		end
+		return base64Encode(encodePNG(raw, tw, th)), tw, th
+	end)
+	pcall(function() img:Destroy() end)
+	if not okRun then return nil, "falha ao codificar PNG: " .. tostring(b64) end
+	return b64, w, h
+end
+
+-- Retorna { image = b64|nil, w, h, scan = texto, method = "print+cena"|"cena" }
+local function visionSnapshot(forceShot)
+	local snap = { scan = "", method = "cena" }
+	if forceShot then
+		Vision.shotDisabled, Vision.shotFails = false, 0
+	end
+	if not Vision.shotDisabled then
+		local b64, w, h = captureScreenshot()
+		if b64 then
+			snap.image, snap.w, snap.h, snap.method = b64, w, h, "print+cena"
+			Vision.shotFails = 0
+		else
+			Vision.shotFails = Vision.shotFails + 1
+			snap.shotError = w
+			if Vision.shotFails >= 2 then Vision.shotDisabled = true end
+		end
+	end
+	local okS, scan = pcall(sceneScan)
+	snap.scan = okS and scan or ("(varredura falhou: " .. tostring(scan) .. ")")
+	Vision.lastMethod = snap.method
+	return snap
+end
+
+-- ═══════════════════════ FERRAMENTAS ROBLOX (agente) ═══════════════════════
+local Tools, ToolOrder = {}, {}
+local function defTool(name, description, properties, fn, opts)
+	local decl = { name = name, description = description }
+	if properties then decl.parameters = { type = "OBJECT", properties = properties } end
+	Tools[name] = { decl = decl, fn = fn, confirm = opts and opts.confirm or false }
+	ToolOrder[#ToolOrder + 1] = name
+end
+
+local Spawn = { folder = nil }
+local function getFolder()
+	if Spawn.folder and Spawn.folder.Parent then return Spawn.folder end
+	local f = workspace:FindFirstChild(CONFIG.SPAWN_FOLDER)
+	if not f then
+		f = Instance.new("Folder")
+		f.Name = CONFIG.SPAWN_FOLDER
+		f.Parent = workspace
+	end
+	Spawn.folder = f
+	return f
+end
+
+local function myRig()
+	local ch = LocalPlayer.Character
+	if not ch then return nil end
+	return ch, ch:FindFirstChild("HumanoidRootPart"), ch:FindFirstChildOfClass("Humanoid")
+end
+
+local function groundY(pos, ignore)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignore
+	local hit = workspace:Raycast(pos + Vector3.new(0, 12, 0), Vector3.new(0, -80, 0), params)
+	return hit and hit.Position.Y or nil
+end
+
+-- ponto a `distance` studs a frente do jogador; retorna pos, groundY, root  (ou nil, erro)
+local function frontPoint(distance)
+	local ch, root = myRig()
+	if not root then return nil, "personagem nao encontrado" end
+	local look = root.CFrame.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	if flat.Magnitude < 0.01 then flat = Vector3.new(0, 0, -1) end
+	local pos = root.Position + flat.Unit * distance
+	return pos, groundY(pos, { ch, getFolder() }), root
+end
+
+local COLOR_NAMES = {
+	vermelho = Color3.fromRGB(230, 50, 50), red = Color3.fromRGB(230, 50, 50),
+	azul = Color3.fromRGB(50, 100, 230), blue = Color3.fromRGB(50, 100, 230),
+	verde = Color3.fromRGB(50, 190, 90), green = Color3.fromRGB(50, 190, 90),
+	amarelo = Color3.fromRGB(245, 215, 50), yellow = Color3.fromRGB(245, 215, 50),
+	laranja = Color3.fromRGB(245, 140, 40), orange = Color3.fromRGB(245, 140, 40),
+	roxo = Color3.fromRGB(140, 90, 240), purple = Color3.fromRGB(140, 90, 240),
+	rosa = Color3.fromRGB(240, 100, 170), pink = Color3.fromRGB(240, 100, 170),
+	preto = Color3.fromRGB(20, 20, 20), black = Color3.fromRGB(20, 20, 20),
+	branco = Color3.fromRGB(245, 245, 245), white = Color3.fromRGB(245, 245, 245),
+	cinza = Color3.fromRGB(150, 150, 155), gray = Color3.fromRGB(150, 150, 155),
+	marrom = Color3.fromRGB(120, 80, 50), brown = Color3.fromRGB(120, 80, 50),
+	ciano = Color3.fromRGB(40, 200, 220), cyan = Color3.fromRGB(40, 200, 220),
+}
+
+local function parseColor(s)
+	if not s or tostring(s) == "" then return nil end
+	s = trim(tostring(s):lower())
+	if COLOR_NAMES[s] then return COLOR_NAMES[s] end
+	local hex = s:match("^#?(%x%x%x%x%x%x)$")
+	if hex then
+		return Color3.fromRGB(tonumber(hex:sub(1, 2), 16), tonumber(hex:sub(3, 4), 16), tonumber(hex:sub(5, 6), 16))
+	end
+	local ok, c = pcall(function() return BrickColor.new(s).Color end)
+	if ok and c then return c end
+	return nil
+end
+
+local MATERIAL_PT = {
+	madeira = "Wood", metal = "Metal", vidro = "Glass", tijolo = "Brick", concreto = "Concrete",
+	plastico = "Plastic", plástico = "Plastic", grama = "Grass", gelo = "Ice", areia = "Sand", pedra = "Slate",
+}
+local function parseMaterial(name)
+	if not name or tostring(name) == "" then return nil end
+	local low = tostring(name):lower():gsub("%s", "")
+	low = MATERIAL_PT[low] and MATERIAL_PT[low]:lower() or low
+	for _, item in ipairs(Enum.Material:GetEnumItems()) do
+		if item.Name:lower() == low then return item end
+	end
+	return nil
+end
+
+local function buildBlockDummy()
+	local m = Instance.new("Model")
+	m.Name = "NPC"
+	local function part(name, size, offset, color)
+		local p = Instance.new("Part")
+		p.Name, p.Size, p.Color = name, size, color
+		p.TopSurface, p.BottomSurface = Enum.SurfaceType.Smooth, Enum.SurfaceType.Smooth
+		p.CFrame = CFrame.new(offset)
+		p.Parent = m
+		return p
+	end
+	local skin, shirt, pants = Color3.fromRGB(245, 205, 48), Color3.fromRGB(13, 105, 172), Color3.fromRGB(80, 160, 90)
+	local root = part("HumanoidRootPart", Vector3.new(2, 2, 1), Vector3.new(0, 0, 0), shirt)
+	root.Transparency = 1
+	local limbs = {
+		part("Torso", Vector3.new(2, 2, 1), Vector3.new(0, 0, 0), shirt),
+		part("Head", Vector3.new(1.2, 1.2, 1.2), Vector3.new(0, 1.6, 0), skin),
+		part("Left Arm", Vector3.new(1, 2, 1), Vector3.new(-1.5, 0, 0), skin),
+		part("Right Arm", Vector3.new(1, 2, 1), Vector3.new(1.5, 0, 0), skin),
+		part("Left Leg", Vector3.new(1, 2, 1), Vector3.new(-0.5, -2, 0), pants),
+		part("Right Leg", Vector3.new(1, 2, 1), Vector3.new(0.5, -2, 0), pants),
+	}
+	for _, p in ipairs(limbs) do
+		local w = Instance.new("WeldConstraint")
+		w.Part0, w.Part1, w.Parent = root, p, p
+		p.CanCollide = false
+	end
+	local hum = Instance.new("Humanoid")
+	hum.RigType = Enum.HumanoidRigType.R15
+	hum.HipHeight = 2
+	hum.Parent = m
+	m.PrimaryPart = root
+	return m
+end
+
+local function buildNpcModel(appearance)
+	appearance = tostring(appearance or "noob")
+	local lower = appearance:lower()
+	local ok, model = pcall(function()
+		local desc
+		if lower == "clone" then
+			desc = Players:GetHumanoidDescriptionFromUserId(LocalPlayer.UserId)
+		elseif lower ~= "noob" and lower ~= "" then
+			desc = Players:GetHumanoidDescriptionFromUserId(Players:GetUserIdFromNameAsync(appearance))
+		else
+			desc = Instance.new("HumanoidDescription")
+		end
+		return Players:CreateHumanoidModelFromDescription(desc, Enum.HumanoidRigType.R15)
+	end)
+	if ok and model then return model, "avatar" end
+
+	local ch = LocalPlayer.Character
+	if ch then
+		local prev = ch.Archivable
+		ch.Archivable = true
+		local okc, clone = pcall(function() return ch:Clone() end)
+		ch.Archivable = prev
+		if okc and clone then
+			for _, d in ipairs(clone:GetDescendants()) do
+				if d:IsA("LocalScript") or d:IsA("Script") then d:Destroy() end
+			end
+			return clone, "clone do seu personagem"
+		end
+	end
+	return buildBlockDummy(), "boneco de blocos"
+end
+
+local function attachBubble(model, text, seconds)
+	local adornee = model:FindFirstChild("Head") or model.PrimaryPart
+	if not adornee then return end
+	local bb = new("BillboardGui", {
+		Size = UDim2.fromOffset(220, 44), StudsOffset = Vector3.new(0, 3.2, 0),
+		AlwaysOnTop = true, Adornee = adornee,
+	})
+	local lbl = new("TextLabel", {
+		Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Color3.fromRGB(20, 20, 26), BackgroundTransparency = 0.2,
+		Font = Enum.Font.GothamMedium, TextSize = 14, TextColor3 = Color3.new(1, 1, 1),
+		TextWrapped = true, Text = tostring(text),
+	}, bb)
+	corner(lbl, 10)
+	bb.Parent = adornee
+	task.delay(seconds or 8, function() if bb then bb:Destroy() end end)
+end
+
+defTool("spawn_npc",
+	"Cria um NPC humanoide LOCAL (so o usuario ve) na frente do jogador, virado para ele.",
+	{
+		name = { type = "STRING", description = "Nome exibido acima do NPC" },
+		distance = { type = "NUMBER", description = "Distancia em studs a frente do jogador (padrao 8)" },
+		appearance = { type = "STRING", description = "'noob' (padrao), 'clone' (copia do jogador) ou um nome de usuario Roblox" },
+		say = { type = "STRING", description = "Fala opcional exibida em balao sobre o NPC" },
+		follow = { type = "BOOLEAN", description = "Se true, o NPC segue o jogador" },
+	},
+	function(a)
+		local dist = math.clamp(tonumber(a.distance) or 8, 2, 120)
+		local pos, gy, root = frontPoint(dist)
+		if not pos then return false, gy end
+		local model, how = buildNpcModel(a.appearance)
+		local name = (a.name and tostring(a.name) ~= "") and tostring(a.name) or "NPC"
+		model.Name = name
+		local hum = model:FindFirstChildOfClass("Humanoid")
+		if hum then
+			hum.DisplayName = name
+			hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.Viewer
+		end
+		model.Parent = getFolder()
+		local hrp = model:FindFirstChild("HumanoidRootPart")
+		if hrp and not model.PrimaryPart then model.PrimaryPart = hrp end
+
+		local base = gy or (root.Position.Y - 3)
+		local at = Vector3.new(pos.X, base + 5, pos.Z)
+		model:PivotTo(CFrame.lookAt(at, Vector3.new(root.Position.X, at.Y, root.Position.Z)))
+		local bbCf, bbSize = model:GetBoundingBox()
+		local bottom = bbCf.Position.Y - bbSize.Y / 2
+		model:PivotTo(model:GetPivot() + Vector3.new(0, base - bottom + 0.05, 0))
+
+		if a.say and tostring(a.say) ~= "" then attachBubble(model, a.say, 8) end
+		if a.follow and hum and hrp then
+			task.spawn(function()
+				while model.Parent and hum.Health > 0 do
+					local _, r = myRig()
+					if r then
+						local away = (hrp.Position - r.Position)
+						if away.Magnitude > 5 then hum:MoveTo(r.Position + away.Unit * 4) end
+					end
+					task.wait(0.4)
+				end
+			end)
+		end
+		return true, ("NPC '%s' criado a %d studs a sua frente (%s)%s."):format(
+			name, math.floor(dist), how, a.follow and ", seguindo voce" or "")
+	end)
+
+defTool("spawn_part",
+	"Cria uma peca 3D LOCAL (so o usuario ve) na frente do jogador.",
+	{
+		shape = { type = "STRING", description = "block | ball | cylinder | wedge (padrao block)" },
+		size_x = { type = "NUMBER", description = "Largura em studs (padrao 4)" },
+		size_y = { type = "NUMBER", description = "Altura em studs (padrao 4)" },
+		size_z = { type = "NUMBER", description = "Profundidade em studs (padrao 4)" },
+		color = { type = "STRING", description = "Nome da cor (vermelho, azul...) ou hex #RRGGBB" },
+		material = { type = "STRING", description = "Material (Plastic, Neon, Wood, Metal, Glass...)" },
+		distance = { type = "NUMBER", description = "Distancia a frente do jogador (padrao 8)" },
+		elevation = { type = "NUMBER", description = "Studs acima do chao (padrao 0)" },
+		anchored = { type = "BOOLEAN", description = "Fixa no ar (padrao true)" },
+		transparency = { type = "NUMBER", description = "0 (solido) a 1 (invisivel)" },
+		name = { type = "STRING", description = "Nome da peca" },
+	},
+	function(a)
+		local dist = math.clamp(tonumber(a.distance) or 8, 2, 120)
+		local pos, gy, root = frontPoint(dist)
+		if not pos then return false, gy end
+		local sx = math.clamp(tonumber(a.size_x) or 4, 0.2, 300)
+		local sy = math.clamp(tonumber(a.size_y) or 4, 0.2, 300)
+		local sz = math.clamp(tonumber(a.size_z) or 4, 0.2, 300)
+		local shape = tostring(a.shape or "block"):lower()
+		local class = (shape == "wedge" or shape == "cunha") and "WedgePart" or "Part"
+		local p = Instance.new(class)
+		if class == "Part" then
+			if shape == "ball" or shape == "sphere" or shape == "esfera" then
+				p.Shape = Enum.PartType.Ball
+			elseif shape == "cylinder" or shape == "cilindro" then
+				p.Shape = Enum.PartType.Cylinder
+			end
+		end
+		p.Name = (a.name and tostring(a.name) ~= "") and tostring(a.name) or "Peca"
+		p.Size = Vector3.new(sx, sy, sz)
+		p.Anchored = a.anchored ~= false
+		p.Color = parseColor(a.color) or Color3.fromRGB(163, 162, 165)
+		local mat = parseMaterial(a.material)
+		if mat then p.Material = mat end
+		p.Transparency = math.clamp(tonumber(a.transparency) or 0, 0, 1)
+		local base = gy or (root.Position.Y - 3)
+		p.CFrame = CFrame.new(pos.X, base + sy / 2 + (tonumber(a.elevation) or 0), pos.Z)
+		p.Parent = getFolder()
+		return true, ("Peca '%s' (%s, %.0fx%.0fx%.0f) criada a %d studs a sua frente."):format(
+			p.Name, shape, sx, sy, sz, math.floor(dist))
+	end)
+
+defTool("set_player",
+	"Ajusta atributos LOCAIS do personagem/camera do usuario.",
+	{
+		walk_speed = { type = "NUMBER", description = "WalkSpeed (0-500)" },
+		jump_power = { type = "NUMBER", description = "JumpPower (0-500)" },
+		gravity = { type = "NUMBER", description = "Gravidade do workspace (padrao 196.2)" },
+		fov = { type = "NUMBER", description = "Campo de visao da camera (1-120)" },
+	},
+	function(a)
+		local _, _, hum = myRig()
+		local done = {}
+		if hum and a.walk_speed then
+			hum.WalkSpeed = math.clamp(tonumber(a.walk_speed) or 16, 0, 500)
+			done[#done + 1] = "velocidade=" .. hum.WalkSpeed
+		end
+		if hum and a.jump_power then
+			hum.UseJumpPower = true
+			hum.JumpPower = math.clamp(tonumber(a.jump_power) or 50, 0, 500)
+			done[#done + 1] = "pulo=" .. hum.JumpPower
+		end
+		if a.gravity then
+			workspace.Gravity = math.clamp(tonumber(a.gravity) or 196.2, 0, 1000)
+			done[#done + 1] = "gravidade=" .. workspace.Gravity
+		end
+		if a.fov and workspace.CurrentCamera then
+			workspace.CurrentCamera.FieldOfView = math.clamp(tonumber(a.fov) or 70, 1, 120)
+			done[#done + 1] = "fov=" .. workspace.CurrentCamera.FieldOfView
+		end
+		if #done == 0 then return false, "nenhum atributo valido informado" end
+		return true, "Ajustado: " .. table.concat(done, ", ")
+	end)
+
+defTool("teleport",
+	"Teleporta o jogador para coordenadas OU para perto de outro jogador.",
+	{
+		x = { type = "NUMBER", description = "Coordenada X" },
+		y = { type = "NUMBER", description = "Coordenada Y" },
+		z = { type = "NUMBER", description = "Coordenada Z" },
+		player_name = { type = "STRING", description = "Nome/apelido (parcial) do jogador alvo" },
+	},
+	function(a)
+		local _, root = myRig()
+		if not root then return false, "personagem nao encontrado" end
+		if a.player_name and tostring(a.player_name) ~= "" then
+			local q = tostring(a.player_name):lower()
+			for _, p in ipairs(Players:GetPlayers()) do
+				if p ~= LocalPlayer and (p.Name:lower():find(q, 1, true) or p.DisplayName:lower():find(q, 1, true)) then
+					local hrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+					if hrp then
+						root.CFrame = hrp.CFrame * CFrame.new(0, 0, 4)
+						return true, "Teleportado para perto de " .. p.DisplayName
+					end
+				end
+			end
+			return false, "jogador nao encontrado: " .. tostring(a.player_name)
+		end
+		if a.x and a.y and a.z then
+			root.CFrame = CFrame.new(tonumber(a.x) or 0, (tonumber(a.y) or 0) + 3, tonumber(a.z) or 0)
+			return true, ("Teleportado para (%.0f, %.0f, %.0f)"):format(a.x, a.y, a.z)
+		end
+		return false, "informe x,y,z ou player_name"
+	end)
+
+defTool("set_environment",
+	"Ajusta a iluminacao LOCAL (hora do dia e brilho).",
+	{
+		clock_time = { type = "NUMBER", description = "Hora do dia 0-24 (0=meia-noite, 12=meio-dia)" },
+		brightness = { type = "NUMBER", description = "Brilho da iluminacao (0-10)" },
+	},
+	function(a)
+		local done = {}
+		if a.clock_time then
+			Lighting.ClockTime = math.clamp(tonumber(a.clock_time) or 12, 0, 24)
+			done[#done + 1] = "hora=" .. Lighting.ClockTime
+		end
+		if a.brightness then
+			Lighting.Brightness = math.clamp(tonumber(a.brightness) or 2, 0, 10)
+			done[#done + 1] = "brilho=" .. Lighting.Brightness
+		end
+		if #done == 0 then return false, "nenhum valor informado" end
+		return true, "Ambiente ajustado: " .. table.concat(done, ", ")
+	end)
+
+defTool("remove_spawned",
+	"Remove objetos criados pelas ferramentas (todos, ou pelo nome).",
+	{ name = { type = "STRING", description = "Nome do objeto ou 'all' (padrao)" } },
+	function(a)
+		local f = getFolder()
+		local target = a.name and tostring(a.name):lower() or "all"
+		local n = 0
+		for _, c in ipairs(f:GetChildren()) do
+			if target == "all" or target == "" or c.Name:lower() == target then
+				c:Destroy()
+				n = n + 1
+			end
+		end
+		return true, ("%d objeto(s) removido(s)."):format(n)
+	end)
+
+defTool("get_nearby",
+	"Lista objetos e jogadores proximos do personagem.",
+	{ radius = { type = "NUMBER", description = "Raio em studs (padrao 40, max 300)" } },
+	function(a)
+		local ch, root = myRig()
+		if not root then return false, "personagem nao encontrado" end
+		local radius = math.clamp(tonumber(a.radius) or 40, 5, 300)
+		local params = OverlapParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = { ch }
+		local parts = workspace:GetPartBoundsInRadius(root.Position, radius, params)
+		local groups, order = {}, {}
+		for _, p in ipairs(parts) do
+			local model = p:FindFirstAncestorOfClass("Model")
+			local label = (model and model ~= workspace) and model.Name or p.Name
+			local g = groups[label]
+			local d = (p.Position - root.Position).Magnitude
+			if not g then
+				g = { n = 0, min = d }
+				groups[label] = g
+				order[#order + 1] = label
+			end
+			g.n = g.n + 1
+			if d < g.min then g.min = d end
+		end
+		table.sort(order, function(x, y) return groups[x].min < groups[y].min end)
+		local out = { ("Objetos em %d studs (%d pecas):"):format(math.floor(radius), #parts) }
+		for i = 1, math.min(20, #order) do
+			out[#out + 1] = ("  - %s (%d pecas, mais proximo a %.0f studs)"):format(order[i], groups[order[i]].n, groups[order[i]].min)
+		end
+		for _, p in ipairs(Players:GetPlayers()) do
+			local hrp = p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+			if hrp and (hrp.Position - root.Position).Magnitude <= radius then
+				out[#out + 1] = ("  * jogador %s a %.0f studs"):format(p.DisplayName, (hrp.Position - root.Position).Magnitude)
+			end
+		end
+		return true, table.concat(out, "\n")
+	end)
+
+defTool("look_at_screen",
+	"Varre a cena que o jogador esta vendo agora (objetos visiveis, distancias, jogadores, textos de UI).",
+	nil,
+	function()
+		local ok, scan = pcall(sceneScan)
+		if not ok then return false, tostring(scan) end
+		return true, scan
+	end)
+
+defTool("get_server_info",
+	"Retorna o contexto atualizado do servidor (jogo, jogadores, equipes, instancias).",
+	nil,
+	function()
+		return true, buildServerContext(true)
+	end)
+
+-- run_luau: exige confirmacao do usuario (a menos que /auto esteja ligado)
+local BLOCKED_GLOBALS = {
+	getgenv = true, getrenv = true, getreg = true, request = true, http_request = true, http = true,
+	syn = true, fluxus = true, writefile = true, readfile = true, appendfile = true, delfile = true,
+	listfiles = true, makefolder = true, delfolder = true, loadfile = true, dofile = true,
+	setclipboard = true, toclipboard = true, set_clipboard = true, isfile = true, isfolder = true,
+	queue_on_teleport = true, hookfunction = true, hookmetamethod = true, getrawmetatable = true,
+	setrawmetatable = true, Clipboard = true,
+}
+local BLOCKED_TEXT = {
+	"HttpService", "HttpGet", "HttpPost", "http_request", "writefile", "readfile", "appendfile", "delfile",
+	"getgenv", "setclipboard", "toclipboard", "queue_on_teleport", "TeleportService", "hookfunction",
+	"hookmetamethod", "getrawmetatable", "loadfile", "dofile", "AnonimoAI", "PromptPurchase", "PromptProductPurchase",
+}
+
+local function staticScan(code)
+	for _, word in ipairs(BLOCKED_TEXT) do
+		if code:find(word, 1, true) then return "uso de '" .. word .. "' e bloqueado por seguranca" end
+	end
+	return nil
+end
+
+local function sandboxEnv()
+	local base = (getfenv and getfenv(1)) or _G
+	return setmetatable({}, {
+		__index = function(_, k)
+			if BLOCKED_GLOBALS[k] then return nil end
+			return base[k]
+		end,
+	})
+end
+
+local toolCtx = {} -- preenchido pela GUI (confirmCode)
+
+defTool("run_luau",
+	"Executa codigo Luau LOCAL no jogo do usuario (client-side). Use APENAS quando nenhuma outra ferramenta resolver. O usuario precisa aprovar.",
+	{
+		code = { type = "STRING", description = "Codigo Luau completo e seguro a executar" },
+		purpose = { type = "STRING", description = "Explicacao curta do que o codigo faz" },
+	},
+	function(a)
+		local code = tostring(a.code or "")
+		if code == "" then return false, "codigo vazio" end
+		local bad = staticScan(code)
+		if bad then return false, "bloqueado: " .. bad end
+		if not loadstring then return false, "loadstring indisponivel neste executor" end
+		if not Settings.autoRun then
+			local approved = toolCtx.confirmCode and toolCtx.confirmCode(code, a.purpose) or false
+			if not approved then return false, "o usuario recusou a execucao" end
+		end
+		local fn, err = loadstring(code)
+		if not fn then return false, "erro de sintaxe: " .. tostring(err) end
+		if setfenv then pcall(setfenv, fn, sandboxEnv()) end
+		local ok, res = pcall(fn)
+		if not ok then return false, "erro em execucao: " .. tostring(res) end
+		return true, "Codigo executado" .. ((res ~= nil) and (" (retorno: " .. shorten(tostring(res), 80) .. ")") or ".")
+	end,
+	{ confirm = true })
+
+-- ═══════════════════════ API GEMINI ═══════════════════════
+local State = { busy = false, activeModel = nil, noThinking = false }
+
+local function httpPost(url, headers, body)
+	local req = { Url = url, Method = "POST", Headers = headers, Body = body }
+	local ok, res
+	if httpRequest then
+		ok, res = pcall(httpRequest, req)
+	else
+		ok, res = pcall(function() return HttpService:RequestAsync(req) end)
+	end
+	if not ok then return false, 0, tostring(res) end
+	if type(res) ~= "table" then return false, 0, "resposta invalida" end
+	return true, res.StatusCode or res.status_code or 0, res.Body or res.body or ""
+end
+
+local function buildToolsDecl()
+	local decls = {}
+	for _, name in ipairs(ToolOrder) do decls[#decls + 1] = Tools[name].decl end
+	return { { functionDeclarations = decls } }
+end
+
+local ROBLOX_RULES = table.concat({
+	"MODO ROBLOX ATIVO: voce controla o jogo do usuario por FERRAMENTAS (function calling).",
+	"- Quando o usuario pedir uma acao (criar NPC, peca, teleportar, mudar hora, velocidade...), CHAME a ferramenta correspondente em vez de so explicar.",
+	"- Prefira ferramentas especificas; use run_luau apenas quando nenhuma resolver (o usuario precisa aprovar).",
+	"- Tudo e LOCAL (client-side): so o usuario ve os efeitos. Diga isso brevemente se for relevante.",
+	"- Depois de agir, confirme em 1-2 frases o que foi feito. Se uma ferramenta falhar, explique e tente alternativa.",
+	"- 'na minha frente' => distance ~8. Pedidos vagos: escolha padroes sensatos em vez de perguntar.",
+}, "\n")
+
+local function buildSystemPrompt(ctx)
+	local parts = {
+		"Voce e o ANÔNIMO AI, assistente integrado a uma janela flutuante DENTRO de um jogo do Roblox.",
+		"Especialista em Luau, API do Roblox, otimizacao e depuracao.",
+		"Regras: responda no idioma do usuario (padrao: portugues do Brasil); seja direto e compacto (tela pequena); "
+			.. "entregue codigo em blocos ```lua ... ```; mantenha o texto fora dos blocos curto.",
+		"Use o CONTEXTO DO SERVIDOR abaixo (tempo real) quando relevante.",
+	}
+	if Settings.roblox then parts[#parts + 1] = ROBLOX_RULES end
+	if Settings.vision then
+		parts[#parts + 1] = "VISAO ATIVA: a mensagem do usuario pode trazer um print da tela dele e uma varredura da cena. Use-os para responder sobre o que ele ve."
+	end
+	parts[#parts + 1] = ""
+	parts[#parts + 1] = "=== CONTEXTO DO SERVIDOR ==="
+	parts[#parts + 1] = ctx
+	parts[#parts + 1] = "=== FIM DO CONTEXTO ==="
+	return table.concat(parts, "\n")
+end
+
+local function friendlyError(status, msg)
+	local m = tostring(msg or "")
+	local low = m:lower()
+	if status == 400 and (low:find("api key") or low:find("api_key")) then return "API Key invalida. Use /key SUA_CHAVE." end
+	if status == 403 then return "Acesso negado (403): " .. m end
+	if status == 429 then return "Cota/limite de requisicoes atingido (429). Aguarde um pouco ou ajuste /limite. " .. shorten(m, 120) end
+	return ("Erro da API (%s): %s"):format(tostring(status), shorten(m, 240))
+end
+
+-- retorna (true, {content, text, calls, usage, finish}) ou (false, erro)
+local function apiGenerate(contents, systemText, withTools, onStatus)
+	local body = {
+		systemInstruction = { parts = { { text = systemText } } },
+		contents = contents,
+		generationConfig = { maxOutputTokens = CONFIG.MAX_OUTPUT_TOKENS },
+	}
+	if Settings.thinking ~= "" and not State.noThinking then
+		body.generationConfig.thinkingConfig = { thinkingLevel = Settings.thinking }
+	end
+	if withTools then body.tools = buildToolsDecl() end
+
+	local fallbackIdx = 0
+	local model = State.activeModel or Settings.model
+	local attempts, lastErr = 0, "erro desconhecido"
+
+	while attempts < CONFIG.MAX_RETRIES + 3 do
+		attempts = attempts + 1
+		waitForSlot(onStatus)
+		local url = ("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"):format(model)
+		local okEnc, payload = pcall(HttpService.JSONEncode, HttpService, body)
+		if not okEnc then return false, "falha ao montar requisicao: " .. tostring(payload) end
+		local headers = { ["Content-Type"] = "application/json", ["x-goog-api-key"] = Settings.apiKey }
+
+		if onStatus then onStatus("Pensando") end
+		local ok, status, raw = httpPost(url, headers, payload)
+		if not ok then
+			local hint = httpRequest and "" or "\n(seu executor nao expoe request/http_request)"
+			return false, "falha de rede: " .. tostring(raw) .. hint
+		end
+		noteRequest()
+
+		local decoded, data = pcall(HttpService.JSONDecode, HttpService, raw)
+		if not decoded then data = nil end
+
+		if status >= 200 and status < 300 and type(data) == "table" then
+			local cand = data.candidates and data.candidates[1]
+			local content = cand and cand.content
+			if content and type(content.parts) == "table" then
+				local texts, calls = {}, {}
+				for _, p in ipairs(content.parts) do
+					if p.text and not p.thought then texts[#texts + 1] = p.text end
+					if p.functionCall then
+						local fc = p.functionCall
+						if type(fc.args) == "table" and next(fc.args) == nil then fc.args = nil end
+						calls[#calls + 1] = fc
+					end
+				end
+				content.role = "model"
+				local p = noteTokens(data.usageMetadata)
+				State.activeModel = (model ~= Settings.model) and model or nil
+				return true, {
+					content = content, text = table.concat(texts), calls = calls,
+					promptTokens = p, finish = cand.finishReason,
+				}
+			end
+			noteTokens(data.usageMetadata)
+			local block = data.promptFeedback and data.promptFeedback.blockReason
+			return false, block and ("Prompt bloqueado: " .. tostring(block))
+				or ("Resposta vazia (finishReason: " .. tostring(cand and cand.finishReason) .. ")")
+		end
+
+		local msg = type(data) == "table" and data.error and data.error.message or ("HTTP " .. tostring(status))
+		lastErr = friendlyError(status, msg)
+
+		if status == 404 and CONFIG.MODEL_FALLBACKS[fallbackIdx + 1] then
+			fallbackIdx = fallbackIdx + 1
+			model = CONFIG.MODEL_FALLBACKS[fallbackIdx]
+			if onStatus then onStatus("Modelo indisponivel, tentando " .. model) end
+		elseif status == 400 and body.generationConfig.thinkingConfig and tostring(msg):lower():find("thinking") then
+			body.generationConfig.thinkingConfig = nil
+			State.noThinking = true
+		elseif status == 429 or status >= 500 or status == 0 then
+			local wait = tonumber(tostring(msg):match("retry in ([%d%.]+)s")) or (1.5 * attempts)
+			if attempts >= CONFIG.MAX_RETRIES + 2 then break end
+			if onStatus then onStatus(("Servidor ocupado, tentando de novo (%ds)"):format(math.ceil(wait))) end
+			task.wait(math.min(wait, 30))
+		else
+			return false, lastErr
+		end
+	end
+	return false, lastErr
+end
+
+-- ═══════════════════════ INTERFACE (GUI) ═══════════════════════
+local TOP_H, PAD, INPUT_H, BTN, SEND, STRIP_H = 46, 10, 44, 28, 34, 26
+local MIN_H = 200
+
+local gui = new("ScreenGui", {
+	Name = CONFIG.GUI_NAME, ResetOnSpawn = false, IgnoreGuiInset = true,
+	DisplayOrder = 999, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+guiRef = gui
+
+do
+	local getters = {}
+	if gethui then getters[#getters + 1] = function() return gethui() end end
+	getters[#getters + 1] = function() return game:GetService("CoreGui") end
+	getters[#getters + 1] = function() return LocalPlayer:WaitForChild("PlayerGui") end
+	local mounted = false
+	for _, get in ipairs(getters) do
+		local ok = pcall(function()
+			local parent = get()
+			for _, c in ipairs(parent:GetChildren()) do
+				if c.Name == CONFIG.GUI_NAME and c ~= gui then c:Destroy() end
+			end
+			gui.Parent = parent
+		end)
+		if ok and gui.Parent then mounted = true break end
+	end
+	if not mounted then error("[ANÔNIMO AI] Nao foi possivel montar a interface (sem permissao de GUI).") end
+end
+
+local screen = gui.AbsoluteSize
+if screen.X < 10 or screen.Y < 10 then
+	local cam = workspace.CurrentCamera
+	screen = cam and cam.ViewportSize or Vector2.new(1280, 720)
+end
+local W = math.clamp(math.floor(screen.X * 0.92), 280, 350)
+local H = math.clamp(math.floor(screen.Y * 0.74), 320, 460)
+local expandedH, minimized = H, false
+
+local main = new("Frame", {
+	Name = "Main", Active = true,
+	Position = UDim2.fromOffset(math.max(4, screen.X - W - 12), math.max(4, (screen.Y - H) / 2)),
+	Size = UDim2.fromOffset(W, H),
+	BackgroundColor3 = THEME.bg, BackgroundTransparency = 0.5, BorderSizePixel = 0,
+	ClipsDescendants = true,
+}, gui)
+corner(main, 20)
+stroke(main, Color3.new(1, 1, 1), 0.85)
+
+-- Barra superior ------------------------------------------------
+local topbar = new("Frame", { Name = "TopBar", Active = true, Size = UDim2.new(1, 0, 0, TOP_H), BackgroundTransparency = 1 }, main)
+
+local function iconButton(parent, text, size, textSize, order)
+	local b = new("TextButton", {
+		Text = text, Font = Enum.Font.GothamBold, TextSize = textSize or 14,
+		TextColor3 = THEME.text, AutoButtonColor = false,
+		BackgroundColor3 = THEME.button, BackgroundTransparency = 0.25, BorderSizePixel = 0,
+		Size = UDim2.fromOffset(size, size), LayoutOrder = order or 0,
+	}, parent)
+	corner(b, size / 2)
+	b:SetAttribute("OrigText", text)
+	local function shade(t) TweenService:Create(b, TweenInfo.new(0.1), { BackgroundTransparency = t }):Play() end
+	b.MouseButton1Down:Connect(function() shade(0.6) end)
+	b.MouseButton1Up:Connect(function() shade(0.25) end)
+	b.MouseLeave:Connect(function() shade(0.25) end)
+	return b
+end
+
+local function flash(btn, ok)
+	btn.Text = ok and "✓" or "✗"
+	task.delay(1.2, function()
+		if btn and btn.Parent then btn.Text = btn:GetAttribute("OrigText") or btn.Text end
+	end)
+end
+
+local histBtn = iconButton(topbar, "☰", BTN, 15, 0)
+histBtn.AnchorPoint, histBtn.Position = Vector2.new(0, 0.5), UDim2.new(0, 10, 0.5, 0)
+
+local RIGHT_W = BTN * 4 + 3 * 4
+local titleX = 10 + BTN + 10
+local title = new("TextLabel", {
+	Name = "Title", Text = CONFIG.APP_NAME, Font = Enum.Font.GothamBlack, TextSize = 14,
+	TextColor3 = Color3.new(1, 1, 1), TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(titleX, 7), Size = UDim2.new(1, -(titleX + RIGHT_W + 14), 0, 18),
+}, topbar)
+local titleGradient = new("UIGradient", { Color = ColorSequence.new(Color3.new(1, 1, 1), THEME.accent) }, title)
+local subtitle = new("TextLabel", {
+	Name = "Subtitle", Text = "", Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = THEME.subtext,
+	TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(titleX, 25), Size = UDim2.new(1, -(titleX + RIGHT_W + 14), 0, 14),
+}, topbar)
+
+local btnHolder = new("Frame", {
+	Name = "Buttons", AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0),
+	Size = UDim2.fromOffset(RIGHT_W, BTN), BackgroundTransparency = 1,
+}, topbar)
+new("UIListLayout", {
+	FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Right,
+	VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder,
+	Padding = UDim.new(0, 4),
+}, btnHolder)
+local visionBtn = iconButton(btnHolder, "👁", BTN, 13, 1)
+local newBtn = iconButton(btnHolder, "➕", BTN, 12, 2)
+local copyAllBtn = iconButton(btnHolder, "📋", BTN, 13, 3)
+local minBtn = iconButton(btnHolder, "-", BTN, 20, 4)
+
+-- Corpo ---------------------------------------------------------
+local body = new("Frame", {
+	Name = "Body", Position = UDim2.fromOffset(0, TOP_H), Size = UDim2.new(1, 0, 1, -TOP_H), BackgroundTransparency = 1,
+}, main)
+new("Frame", {
+	Name = "Divider", Position = UDim2.new(0, 14, 0, 0), Size = UDim2.new(1, -28, 0, 1),
+	BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.9, BorderSizePixel = 0,
+}, body)
+
+-- Faixa de uso --------------------------------------------------
+local strip = new("TextButton", {
+	Name = "UsageStrip", Text = "", AutoButtonColor = false, BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(PAD, 4), Size = UDim2.new(1, -PAD * 2, 0, STRIP_H),
+}, body)
+local stripLabel = new("TextLabel", {
+	Text = "", Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = THEME.subtext,
+	TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 14),
+}, strip)
+local stripTrack = new("Frame", {
+	Position = UDim2.new(0, 0, 0, 17), Size = UDim2.new(1, 0, 0, 4),
+	BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.88, BorderSizePixel = 0,
+}, strip)
+corner(stripTrack, 2)
+local stripFill = new("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = THEME.ok, BorderSizePixel = 0 }, stripTrack)
+corner(stripFill, 2)
+
+-- Chat ----------------------------------------------------------
+local CHAT_TOP = 4 + STRIP_H + 4
+local chat = new("ScrollingFrame", {
+	Name = "Chat", Position = UDim2.fromOffset(PAD, CHAT_TOP),
+	Size = UDim2.new(1, -PAD * 2, 1, -(CHAT_TOP + 8 + PAD + INPUT_H)),
+	BackgroundTransparency = 1, BorderSizePixel = 0,
+	ScrollBarThickness = 2, ScrollBarImageColor3 = THEME.subtext, ScrollBarImageTransparency = 0.4,
+	CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	ScrollingDirection = Enum.ScrollingDirection.Y, ElasticBehavior = Enum.ElasticBehavior.WhenScrollable,
+}, body)
+listLayout(chat, Enum.FillDirection.Vertical, 8)
+
+-- Entrada -------------------------------------------------------
+local inputFrame = new("Frame", {
+	Name = "InputBar", Position = UDim2.new(0, PAD, 1, -(INPUT_H + PAD)),
+	Size = UDim2.new(1, -PAD * 2, 0, INPUT_H),
+	BackgroundColor3 = THEME.input, BackgroundTransparency = 0.2, BorderSizePixel = 0,
+}, body)
+corner(inputFrame, INPUT_H / 2)
+stroke(inputFrame, Color3.new(1, 1, 1), 0.88)
+
+local inputBox = new("TextBox", {
+	Name = "Input", Position = UDim2.fromOffset(16, 0), Size = UDim2.new(1, -(16 + 5 + SEND + 8), 1, 0),
+	BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 14, TextColor3 = THEME.text,
+	PlaceholderText = "Pergunte, peça uma ação ou digite /", PlaceholderColor3 = THEME.subtext,
+	Text = "", ClearTextOnFocus = false, MultiLine = true, TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center,
+}, inputFrame)
+
+local sendBtn = new("TextButton", {
+	Name = "Send", Text = "↑", Font = Enum.Font.GothamBold, TextSize = 18, TextColor3 = Color3.new(1, 1, 1),
+	AutoButtonColor = false, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -5, 0.5, 0),
+	Size = UDim2.fromOffset(SEND, SEND), BackgroundColor3 = THEME.accent, BorderSizePixel = 0,
+}, inputFrame)
+corner(sendBtn, SEND / 2)
+
+-- Paleta de comandos (acima do input) ---------------------------
+local palette = new("Frame", {
+	Name = "Palette", AnchorPoint = Vector2.new(0, 1),
+	Position = UDim2.new(0, PAD, 1, -(INPUT_H + PAD + 6)), Size = UDim2.new(1, -PAD * 2, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = THEME.input, BackgroundTransparency = 0.05,
+	BorderSizePixel = 0, Visible = false, ZIndex = 6,
+}, body)
+corner(palette, 12)
+stroke(palette, Color3.new(1, 1, 1), 0.85)
+padding(palette, 4, 4, 4, 4)
+listLayout(palette, Enum.FillDirection.Vertical, 2)
+
+-- Painel de uso (detalhes) --------------------------------------
+local usagePanel = new("Frame", {
+	Name = "UsagePanel", Position = UDim2.fromOffset(PAD, 4 + STRIP_H + 2), Size = UDim2.new(1, -PAD * 2, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = THEME.bg, BackgroundTransparency = 0.03,
+	BorderSizePixel = 0, Visible = false, ZIndex = 7,
+}, body)
+corner(usagePanel, 14)
+stroke(usagePanel, Color3.new(1, 1, 1), 0.85)
+padding(usagePanel, 10, 12, 10, 12)
+listLayout(usagePanel, Enum.FillDirection.Vertical, 8)
+
+local function mkUsageRow(order, titleText)
+	local row = new("Frame", { LayoutOrder = order, Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, usagePanel)
+	new("TextLabel", {
+		Text = titleText, Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = THEME.text,
+		TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1, Size = UDim2.new(0.5, 0, 0, 14),
+	}, row)
+	local val = new("TextLabel", {
+		Text = "", Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = THEME.subtext,
+		TextXAlignment = Enum.TextXAlignment.Right, BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, 0, 0, 0), Size = UDim2.new(0.5, 0, 0, 14),
+	}, row)
+	local track = new("Frame", {
+		Position = UDim2.new(0, 0, 0, 20), Size = UDim2.new(1, 0, 0, 6),
+		BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.88, BorderSizePixel = 0,
+	}, row)
+	corner(track, 3)
+	local fill = new("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = THEME.ok, BorderSizePixel = 0 }, track)
+	corner(fill, 3)
+	return { val = val, fill = fill }
+end
+local rowRpm = mkUsageRow(1, "Requisições / minuto")
+local rowRpd = mkUsageRow(2, "Requisições / dia")
+local rowTok = mkUsageRow(3, "Tokens hoje")
+local rowCtx = mkUsageRow(4, "Contexto do chat atual")
+local usageNote = new("TextLabel", {
+	LayoutOrder = 5, Text = "Estimativa local (o Google não expõe a cota restante). Ajuste: /limite rpm 10 rpd 250",
+	Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = THEME.subtext, TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+	Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+}, usagePanel)
+
+-- Drawer de historico -------------------------------------------
+local drawer = new("Frame", {
+	Name = "Drawer", Active = true, Position = UDim2.new(-1, 0, 0, 0), Size = UDim2.new(1, 0, 1, 0),
+	BackgroundColor3 = THEME.bg, BackgroundTransparency = 0.04, BorderSizePixel = 0, ZIndex = 20,
+}, body)
+local drawerOpen = false
+new("TextLabel", {
+	Text = "Conversas", Font = Enum.Font.GothamBold, TextSize = 15, TextColor3 = THEME.text,
+	TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(16, 8), Size = UDim2.new(0.5, 0, 0, 24),
+}, drawer)
+local drawerNew = new("TextButton", {
+	Text = "＋ Novo chat", Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Color3.new(1, 1, 1),
+	AutoButtonColor = false, BackgroundColor3 = THEME.accent, BorderSizePixel = 0,
+	AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -PAD, 0, 8), Size = UDim2.fromOffset(104, 26),
+}, drawer)
+corner(drawerNew, 13)
+local searchBox = new("TextBox", {
+	Text = "", PlaceholderText = "🔎 Buscar conversas", PlaceholderColor3 = THEME.subtext,
+	Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = THEME.text, ClearTextOnFocus = false,
+	TextXAlignment = Enum.TextXAlignment.Left, BackgroundColor3 = THEME.input, BackgroundTransparency = 0.2,
+	BorderSizePixel = 0, Position = UDim2.fromOffset(PAD, 42), Size = UDim2.new(1, -PAD * 2, 0, 30),
+}, drawer)
+corner(searchBox, 15)
+padding(searchBox, 0, 12, 0, 12)
+local histList = new("ScrollingFrame", {
+	Position = UDim2.fromOffset(PAD, 80), Size = UDim2.new(1, -PAD * 2, 1, -(80 + PAD)),
+	BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 2,
+	CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+}, drawer)
+listLayout(histList, Enum.FillDirection.Vertical, 6)
+
+-- ═══════════════════════ HIGHLIGHT / MARKDOWN ═══════════════════════
+local LUA_KEYWORDS, BUILTINS = {}, {}
+for _, k in ipairs({ "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in",
+	"local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while", "continue" }) do
+	LUA_KEYWORDS[k] = true
+end
+for _, k in ipairs({ "game", "workspace", "script", "self", "print", "warn", "error", "pairs", "ipairs", "next",
+	"tostring", "tonumber", "type", "typeof", "pcall", "xpcall", "require", "task", "math", "string", "table",
+	"os", "Instance", "Vector3", "Vector2", "CFrame", "Color3", "UDim2", "UDim", "Enum", "TweenInfo", "Random",
+	"Ray", "Rect", "NumberRange", "NumberSequence", "ColorSequence", "setmetatable", "getmetatable", "select",
+	"unpack", "assert", "tick", "time", "wait", "spawn", "delay", "coroutine", "utf8", "bit32", "shared", "_G" }) do
+	BUILTINS[k] = true
+end
+
+local function highlightLua(code)
+	local out, n, i = {}, #code, 1
+	local function emit(color, s)
+		s = escapeRich(s)
+		out[#out + 1] = color and ('<font color="' .. color .. '">' .. s .. '</font>') or s
+	end
+	while i <= n do
+		local c = code:sub(i, i)
+		if code:sub(i, i + 1) == "--" then
+			local eq = code:match("^%-%-%[(=*)%[", i)
+			local e
+			if eq then
+				local _, ce = code:find("]" .. eq .. "]", i + 2, true)
+				e = ce or n
+			else
+				local nl = code:find("\n", i, true)
+				e = nl and (nl - 1) or n
+			end
+			emit(SYN.comment, code:sub(i, e))
+			i = e + 1
+		elseif c == '"' or c == "'" then
+			local j = i + 1
+			while j <= n do
+				local d = code:sub(j, j)
+				if d == "\\" then
+					j = j + 2
+				elseif d == c or d == "\n" then
+					break
+				else
+					j = j + 1
+				end
+			end
+			local e = (j <= n and code:sub(j, j) == c) and j or math.min(j - 1, n)
+			emit(SYN.string, code:sub(i, e))
+			i = e + 1
+		elseif c == "[" and code:match("^%[=*%[", i) then
+			local eq = code:match("^%[(=*)%[", i)
+			local _, ce = code:find("]" .. eq .. "]", i + 1, true)
+			local e = ce or n
+			emit(SYN.string, code:sub(i, e))
+			i = e + 1
+		elseif c:match("%d") then
+			local num = code:match("^0[xX][%x_]+", i) or code:match("^%d[%d_]*%.?%d*", i) or c
+			emit(SYN.number, num)
+			i = i + #num
+		elseif c:match("[%a_]") then
+			local id = code:match("^[%w_]+", i)
+			local nextCh = code:sub(i + #id, i + #id)
+			local color
+			if LUA_KEYWORDS[id] then
+				color = SYN.keyword
+			elseif BUILTINS[id] then
+				color = SYN.builtin
+			elseif nextCh == "(" then
+				color = SYN.func
+			end
+			emit(color, id)
+			i = i + #id
+		else
+			local j = i + 1
+			while j <= n and not code:sub(j, j):match("[%w_\"'%-%[]") do j = j + 1 end
+			emit(nil, code:sub(i, j - 1))
+			i = j
+		end
+	end
+	return table.concat(out)
+end
+
+local function chunkCode(code, maxLen)
+	local chunks, cur, curLen = {}, {}, 0
+	for line in (code .. "\n"):gmatch("(.-)\n") do
+		if curLen + #line + 1 > maxLen and #cur > 0 then
+			chunks[#chunks + 1] = table.concat(cur, "\n")
+			cur, curLen = {}, 0
+		end
+		cur[#cur + 1] = line
+		curLen = curLen + #line + 1
+	end
+	if #cur > 0 then chunks[#chunks + 1] = table.concat(cur, "\n") end
+	return chunks
+end
+
+local function toRich(text)
+	local lines = {}
+	for line in (text .. "\n"):gmatch("(.-)\n") do
+		local heading = line:match("^%s*#+%s+(.+)$")
+		local bullet = (not heading) and line:match("^%s*[%*%-%+]%s+(.+)$")
+		local t = escapeRich(heading or bullet or line)
+		t = t:gsub("`([^`]+)`", '<font face="Code" color="' .. SYN.inline .. '">%1</font>')
+		t = t:gsub("%*%*(.-)%*%*", "<b>%1</b>")
+		if heading then
+			t = "<b>" .. t .. "</b>"
+		elseif bullet then
+			t = "  •  " .. t
+		end
+		lines[#lines + 1] = t
+	end
+	return table.concat(lines, "\n")
+end
+
+local function parseSegments(text)
+	local segs, pos, len = {}, 1, #text
+	while pos <= len do
+		local s, e = text:find("```", pos, true)
+		if not s then
+			local rest = text:sub(pos)
+			if rest:match("%S") then segs[#segs + 1] = { type = "text", content = trim(rest) } end
+			break
+		end
+		local before = text:sub(pos, s - 1)
+		if before:match("%S") then segs[#segs + 1] = { type = "text", content = trim(before) } end
+		local cs, ce = text:find("```", e + 1, true)
+		local block
+		if cs then
+			block = text:sub(e + 1, cs - 1)
+			pos = ce + 1
+		else
+			block = text:sub(e + 1)
+			pos = len + 1
+		end
+		local lang, remainder = block:match("^([%w_%+%-#%.]*)[ \t]*\r?\n(.*)$")
+		if lang then block = remainder else lang = "" end
+		block = block:gsub("^%s*\n", ""):gsub("%s+$", "")
+		if block ~= "" then segs[#segs + 1] = { type = "code", lang = lang:lower(), content = block } end
+	end
+	return segs
+end
+
+-- ═══════════════════════ RENDERIZADOR ═══════════════════════
+local Current
+local msgOrder, scrollUntil = 0, 0
+local statusLabel -- label do indicador "pensando"
+
+local function scrollToBottom()
+	local maxY = math.max(0, chat.AbsoluteCanvasSize.Y - chat.AbsoluteWindowSize.Y)
+	chat.CanvasPosition = Vector2.new(0, maxY)
+end
+
+local function requestScroll()
+	scrollUntil = os.clock() + 0.6
+	task.defer(scrollToBottom)
+end
+
+bind(chat:GetPropertyChangedSignal("AbsoluteCanvasSize"), function()
+	if os.clock() < scrollUntil then scrollToBottom() end
+end)
+
+local function clearRows()
+	for _, child in ipairs(chat:GetChildren()) do
+		if child:IsA("Frame") then child:Destroy() end
+	end
+	msgOrder = 0
+end
+
+local function newRow(kind, widthScale)
+	msgOrder = msgOrder + 1
+	local isUser = kind == "user"
+	local row = new("Frame", {
+		Name = "Row", LayoutOrder = msgOrder, Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+	}, chat)
+	new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Vertical,
+		HorizontalAlignment = isUser and Enum.HorizontalAlignment.Right or Enum.HorizontalAlignment.Left,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}, row)
+	local bubble = new("Frame", {
+		Name = isUser and "UserBubble" or "Bubble",
+		Size = UDim2.new(widthScale or (isUser and 0.86 or 1), 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = isUser and THEME.accent or THEME.panel,
+		BackgroundTransparency = isUser and 0.05 or 0.18, BorderSizePixel = 0,
+	}, row)
+	corner(bubble, 16)
+	if isUser then
+		new("UIGradient", {
+			Name = "G", Rotation = 35,
+			Color = ColorSequence.new(THEME.accent, Color3.new(THEME.accent.R * 0.7, THEME.accent.G * 0.7, THEME.accent.B * 0.85)),
+		}, bubble)
+	else
+		stroke(bubble, Color3.new(1, 1, 1), 0.92)
+	end
+	padding(bubble, 10, 12, 10, 12)
+	listLayout(bubble, Enum.FillDirection.Vertical, 8)
+	return row, bubble
+end
+
+local function createText(parent, text, order, opts)
+	opts = opts or {}
+	return new("TextLabel", {
+		Name = "Text", LayoutOrder = order, BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		Font = opts.font or Enum.Font.Gotham, TextSize = opts.size or 14, TextColor3 = opts.color or THEME.text,
+		TextXAlignment = opts.align or Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+		TextWrapped = true, RichText = opts.rich or false, Text = text,
+	}, parent)
+end
+
+local function createCodeBlock(parent, lang, code, order)
+	code = code:gsub("\t", "    ")
+	local block = new("Frame", {
+		Name = "CodeBlock", LayoutOrder = order, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = THEME.codeBg, BackgroundTransparency = 0.05, BorderSizePixel = 0,
+	}, parent)
+	corner(block, 10)
+	stroke(block, Color3.new(1, 1, 1), 0.9)
+	listLayout(block, Enum.FillDirection.Vertical, 0)
+
+	local header = new("Frame", { Name = "Header", LayoutOrder = 1, Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, block)
+	new("TextLabel", {
+		Text = (lang ~= "" and lang or "código"), Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = THEME.subtext,
+		TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -52, 1, 0),
+	}, header)
+	local copyBtn = iconButton(header, "📋", 22, 11, 0)
+	copyBtn.AnchorPoint, copyBtn.Position = Vector2.new(1, 0.5), UDim2.new(1, -6, 0.5, 0)
+	copyBtn.Activated:Connect(function() flash(copyBtn, copyToClipboard(code)) end)
+
+	new("Frame", {
+		Name = "Line", LayoutOrder = 2, Size = UDim2.new(1, 0, 0, 1),
+		BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.92, BorderSizePixel = 0,
+	}, block)
+
+	local content = new("Frame", {
+		Name = "Content", LayoutOrder = 3, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+	}, block)
+	padding(content, 8, 10, 8, 10)
+	listLayout(content, Enum.FillDirection.Vertical, 0)
+
+	local useHighlight = (lang == "" or lang == "lua" or lang == "luau")
+	for idx, chunk in ipairs(chunkCode(code, 1400)) do
+		local rich = useHighlight and highlightLua(chunk) or escapeRich(chunk)
+		if #rich > 15000 then rich = escapeRich(chunk) end
+		new("TextLabel", {
+			Name = "Code", LayoutOrder = idx, BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+			Font = Enum.Font.Code, TextSize = 12, TextColor3 = THEME.code,
+			TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+			TextWrapped = true, RichText = true, Text = rich,
+		}, content)
+	end
+	return block
+end
+
+local function popIn(bubble)
+	local sc = new("UIScale", { Scale = 0.94 }, bubble)
+	local tw = tween(sc, 0.22, { Scale = 1 }, Enum.EasingStyle.Back)
+	tw.Completed:Connect(function() sc:Destroy() end)
+end
+
+local function renderAI(rec, animate)
+	local _, bubble = newRow("ai")
+	local order = 0
+	local function nextOrder() order = order + 1 return order end
+	local segs = parseSegments(rec.text)
+	if #segs == 0 then segs = { { type = "text", content = rec.text } } end
+	for _, seg in ipairs(segs) do
+		if seg.type == "text" then
+			for _, part in ipairs(splitLong(seg.content, 8000)) do
+				createText(bubble, toRich(part), nextOrder(), { rich = true })
+			end
+		else
+			createCodeBlock(bubble, seg.lang, seg.content, nextOrder())
+		end
+	end
+	local footer = new("Frame", { Name = "Footer", LayoutOrder = nextOrder(), Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1 }, bubble)
+	new("TextLabel", {
+		Text = os.date("%H:%M", rec.t or os.time()), Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = THEME.subtext,
+		TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1, Size = UDim2.new(0.5, 0, 1, 0),
+	}, footer)
+	local cp = iconButton(footer, "📋", 20, 10, 0)
+	cp.AnchorPoint, cp.Position = Vector2.new(1, 0.5), UDim2.new(1, 0, 0.5, 0)
+	cp.Activated:Connect(function() flash(cp, copyToClipboard(rec.text)) end)
+	if animate then popIn(bubble) end
+end
+
+local function renderRecord(rec, animate)
+	if rec.k == "user" then
+		local _, bubble = newRow("user")
+		createText(bubble, rec.text, 1, { color = Color3.new(1, 1, 1) })
+		if rec.vision then
+			createText(bubble, "👁 " .. rec.vision, 2, { color = Color3.fromRGB(215, 225, 255), size = 10 })
+		end
+		if animate then popIn(bubble) end
+	elseif rec.k == "ai" then
+		renderAI(rec, animate)
+	elseif rec.k == "tool" then
+		local _, bubble = newRow("ai")
+		local color = rec.ok and THEME.ok or THEME.danger
+		createText(bubble, ("🛠 <b>%s</b>  %s\n<font color=\"#9696A6\">%s</font>"):format(
+			escapeRich(rec.name or "?"), rec.ok and "✓" or "✗", escapeRich(shorten(rec.text or "", 400))),
+			1, { rich = true, size = 12, color = color })
+		if rec.code then
+			local cp = iconButton(bubble, "📋 copiar código", 22, 10, 2)
+			cp.Size = UDim2.fromOffset(110, 22)
+			cp.Activated:Connect(function() flash(cp, copyToClipboard(rec.code)) end)
+		end
+		if animate then popIn(bubble) end
+	elseif rec.k == "sys" then
+		msgOrder = msgOrder + 1
+		local row = new("Frame", {
+			Name = "Row", LayoutOrder = msgOrder, Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+		}, chat)
+		local color = rec.text:find("⚠", 1, true) == 1 and THEME.danger or THEME.subtext
+		createText(row, rec.text, 1, { color = color, size = 11, align = Enum.TextXAlignment.Center })
+	end
+end
+
+-- Estado vazio (chips de sugestao) -------------------------------
+local submit -- forward
+local setRobloxMode
+
+local function showEmptyState()
+	local e = new("Frame", {
+		Name = "Row", LayoutOrder = 0, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+	}, chat)
+	listLayout(e, Enum.FillDirection.Vertical, 8)
+	padding(e, 14, 0, 0, 0)
+	e:SetAttribute("Empty", true)
+	createText(e, "✦", 1, { size = 30, align = Enum.TextXAlignment.Center, font = Enum.Font.GothamBold })
+	createText(e, CONFIG.APP_NAME, 2, { size = 16, align = Enum.TextXAlignment.Center, font = Enum.Font.GothamBlack })
+	createText(e, "Pergunte, peça ações no jogo ou digite / para ver os comandos.", 3,
+		{ size = 12, color = THEME.subtext, align = Enum.TextXAlignment.Center })
+	local chips = {
+		{ "👁  Descreva o que estou vendo", "Descreva o que estou vendo agora na minha tela.", "vision" },
+		{ "🧍  Coloque um NPC na minha frente", "Coloque um NPC na minha frente.", "roblox" },
+		{ "📊  Resuma este servidor", "Resuma o estado deste servidor com base no contexto.", nil },
+		{ "💻  Crie um script Luau para mim", "Crie um script Luau simples e comentado que eu possa usar como exemplo.", nil },
+	}
+	for i, chip in ipairs(chips) do
+		local b = new("TextButton", {
+			LayoutOrder = 3 + i, Text = chip[1], Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = THEME.text,
+			AutoButtonColor = false, BackgroundColor3 = THEME.panel, BackgroundTransparency = 0.25, BorderSizePixel = 0,
+			Size = UDim2.new(1, 0, 0, 34),
+		}, e)
+		corner(b, 17)
+		stroke(b, Color3.new(1, 1, 1), 0.9)
+		b.Activated:Connect(function()
+			if chip[3] == "roblox" and not Settings.roblox then setRobloxMode(true, true) end
+			if chip[3] == "vision" and not Settings.vision then
+				Settings.vision = true
+				markDirty("settings")
+			end
+			submit(chip[2])
+		end)
+	end
+end
+
+local function hideEmptyState()
+	for _, child in ipairs(chat:GetChildren()) do
+		if child:IsA("Frame") and child:GetAttribute("Empty") then child:Destroy() end
+	end
+end
+
+local function notice(text)
+	renderRecord({ k = "sys", text = text }, false)
+	requestScroll()
+end
+
+-- Indicador "pensando" ---------------------------------------------
+local function showTyping()
+	local row, bubble = newRow("ai", 0.62)
+	local lbl = createText(bubble, "Pensando", 1, { color = THEME.subtext, size = 13 })
+	statusLabel = { base = "Pensando", lbl = lbl }
+	local alive = true
+	task.spawn(function()
+		local dots, i = { ".", "..", "..." }, 0
+		while alive and lbl.Parent do
+			i = i % #dots + 1
+			lbl.Text = statusLabel.base .. dots[i]
+			task.wait(0.4)
+		end
+	end)
+	requestScroll()
+	return function()
+		alive = false
+		statusLabel = nil
+		row:Destroy()
+	end
+end
+
+local function setStatus(text)
+	if statusLabel then statusLabel.base = text end
+end
+
+-- ═══════════════════════ USO (UI) ═══════════════════════
+local function setBar(fill, frac)
+	frac = math.clamp(frac, 0, 1)
+	local color = frac < 0.6 and THEME.ok or (frac < 0.85 and THEME.warn or THEME.danger)
+	tween(fill, 0.25, { Size = UDim2.new(frac, 0, 1, 0), BackgroundColor3 = color })
+end
+
+local function refreshUsageUI()
+	rollDay()
+	local rpm = rpmNow()
+	local reqFrac = Usage.reqs / math.max(1, Settings.rpd)
+	local rpmFrac = rpm / math.max(1, Settings.rpm)
+	local tokFrac = Usage.tokens / math.max(1, Settings.tpd)
+	stripLabel.Text = ("⚡ %d/%d hoje · %d/%d min · %s tok"):format(
+		Usage.reqs, Settings.rpd, rpm, Settings.rpm, fmtNum(Usage.tokens))
+	setBar(stripFill, math.max(reqFrac, rpmFrac, tokFrac))
+	if usagePanel.Visible then
+		local ctxTok = Current and tonumber(Current.ctxTokens) or 0
+		rowRpm.val.Text = ("%d / %d"):format(rpm, Settings.rpm)
+		rowRpd.val.Text = ("%d / %d"):format(Usage.reqs, Settings.rpd)
+		rowTok.val.Text = ("%s / %s"):format(fmtNum(Usage.tokens), fmtNum(Settings.tpd))
+		rowCtx.val.Text = ("%s / %s"):format(fmtNum(ctxTok), fmtNum(CONFIG.CONTEXT_WINDOW))
+		setBar(rowRpm.fill, rpmFrac)
+		setBar(rowRpd.fill, reqFrac)
+		setBar(rowTok.fill, tokFrac)
+		setBar(rowCtx.fill, ctxTok / CONFIG.CONTEXT_WINDOW)
+	end
+end
+
+local function updateSubtitle()
+	local m = State.activeModel or Settings.model
+	local parts = { m }
+	if Settings.roblox then parts[#parts + 1] = "Roblox" end
+	if Settings.vision then parts[#parts + 1] = "👁" end
+	if Settings.autoRun then parts[#parts + 1] = "auto-run" end
+	subtitle.Text = table.concat(parts, " · ")
+	visionBtn.BackgroundColor3 = Settings.vision and THEME.accent or THEME.button
+	visionBtn.BackgroundTransparency = Settings.vision and 0.05 or 0.25
+end
+
+local function applyAccent()
+	THEME.accent = ACCENTS[Settings.accent] or ACCENTS.azul
+	local a = THEME.accent
+	sendBtn.BackgroundColor3 = a
+	drawerNew.BackgroundColor3 = a
+	titleGradient.Color = ColorSequence.new(Color3.new(1, 1, 1), a)
+	for _, d in ipairs(chat:GetDescendants()) do
+		if d.Name == "UserBubble" then
+			d.BackgroundColor3 = a
+			local g = d:FindFirstChild("G")
+			if g then g.Color = ColorSequence.new(a, Color3.new(a.R * 0.7, a.G * 0.7, a.B * 0.85)) end
+		end
+	end
+	updateSubtitle()
+end
+
+-- ═══════════════════════ CHATS (criar / abrir / apagar) ═══════════════════════
+local function touchIndex(c)
+	local meta
+	for _, m in ipairs(Index) do
+		if m.id == c.id then meta = m break end
+	end
+	if not meta then
+		meta = { id = c.id, created = c.created }
+		table.insert(Index, 1, meta)
+	end
+	meta.title, meta.updated, meta.count = c.title, c.updated, #c.log
+	markDirty("index")
+end
+
+local function newChatObject()
+	return { id = newId(), title = "Novo chat", created = os.time(), updated = os.time(), log = {}, contents = {}, ctxTokens = 0 }
+end
+
+local renderToken = 0
+local function renderChat(c)
+	renderToken = renderToken + 1
+	local token = renderToken
+	clearRows()
+	if #c.log == 0 then
+		showEmptyState()
+		refreshUsageUI()
+		return
+	end
+	local start = math.max(1, #c.log - CONFIG.RENDER_LIMIT + 1)
+	if start > 1 then notice(("… %d mensagens anteriores estão salvas (exibindo as mais recentes)"):format(start - 1)) end
+	for i = start, #c.log do
+		renderRecord(c.log[i], false)
+		if i % 6 == 0 then
+			task.wait()
+			if token ~= renderToken then return end
+		end
+	end
+	requestScroll()
+	refreshUsageUI()
+end
+
+local function addRecord(c, rec)
+	rec.t = rec.t or os.time()
+	c.log[#c.log + 1] = rec
+	c.updated = os.time()
+	if rec.k == "user" and (c.title == "Novo chat" or c.title == "") then
+		c.title = shorten(rec.text, 32)
+	end
+	Chats[c.id] = c
+	touchIndex(c)
+	markDirty("chat:" .. c.id)
+	if c == Current then
+		hideEmptyState()
+		renderRecord(rec, true)
+		requestScroll()
+	end
+end
+
+local function loadChat(id)
+	if Chats[id] then return Chats[id] end
+	local c = jsonRead(PATH.chats .. "/" .. id .. ".json")
+	if type(c) ~= "table" or type(c.log) ~= "table" then return nil end
+	c.contents = type(c.contents) == "table" and c.contents or {}
+	c.ctxTokens = tonumber(c.ctxTokens) or 0
+	Chats[id] = c
+	return c
+end
+
+local function openChat(c)
+	Current = c
+	Settings.current = c.id
+	markDirty("settings")
+	task.spawn(renderChat, c)
+end
+
+local function newChat()
+	if Current and #Current.log == 0 then
+		notice("Você já está em um chat vazio.")
+		return
+	end
+	openChat(newChatObject())
+end
+
+local function deleteChat(id)
+	for i, m in ipairs(Index) do
+		if m.id == id then table.remove(Index, i) break end
+	end
+	Chats[id] = nil
+	dirty["chat:" .. id] = nil
+	markDirty("index")
+	if FS_OK and delfile then pcall(delfile, PATH.chats .. "/" .. id .. ".json") end
+	if Current and Current.id == id then
+		local nextMeta = Index[1]
+		local nextChat = nextMeta and loadChat(nextMeta.id) or nil
+		openChat(nextChat or newChatObject())
+	end
+end
+
+local function exportText(c)
+	local parts = { CONFIG.APP_NAME .. " — " .. c.title }
+	for _, r in ipairs(c.log) do
+		if r.k == "user" then
+			parts[#parts + 1] = "Você:\n" .. r.text
+		elseif r.k == "ai" then
+			parts[#parts + 1] = CONFIG.APP_NAME .. ":\n" .. r.text
+		elseif r.k == "tool" then
+			parts[#parts + 1] = ("[ferramenta %s] %s"):format(r.name or "?", r.text or "")
+		end
+	end
+	return table.concat(parts, "\n\n")
+end
+
+-- Drawer: lista -------------------------------------------------
+local function setDrawer(open)
+	drawerOpen = open
+	if open then
+		usagePanel.Visible = false
+		inputBox:ReleaseFocus()
+		refreshHistory()
+	end
+	tween(drawer, 0.28, { Position = open and UDim2.new(0, 0, 0, 0) or UDim2.new(-1, 0, 0, 0) })
+end
+
+function refreshHistory()
+	for _, c in ipairs(histList:GetChildren()) do
+		if c:IsA("Frame") then c:Destroy() end
+	end
+	local q = searchBox.Text:lower()
+	local list = {}
+	for _, m in ipairs(Index) do
+		if q == "" or (m.title or ""):lower():find(q, 1, true) then list[#list + 1] = m end
+	end
+	table.sort(list, function(a, b) return (a.updated or 0) > (b.updated or 0) end)
+	if #list == 0 then
+		local empty = new("Frame", { Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1 }, histList)
+		createText(empty, "Nenhuma conversa ainda.", 1, { color = THEME.subtext, size = 12, align = Enum.TextXAlignment.Center })
+		return
+	end
+	for i, m in ipairs(list) do
+		local active = Current and Current.id == m.id
+		local item = new("Frame", {
+			LayoutOrder = i, Size = UDim2.new(1, 0, 0, 46),
+			BackgroundColor3 = active and THEME.accent or THEME.panel, BackgroundTransparency = active and 0.55 or 0.3,
+			BorderSizePixel = 0,
+		}, histList)
+		corner(item, 12)
+		local open = new("TextButton", {
+			Text = "", AutoButtonColor = false, BackgroundTransparency = 1, Size = UDim2.new(1, -44, 1, 0),
+		}, item)
+		new("TextLabel", {
+			Text = m.title or "Chat", Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = THEME.text,
+			TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 6), Size = UDim2.new(1, -20, 0, 18),
+		}, open)
+		new("TextLabel", {
+			Text = ("%s · %d msgs"):format(fmtDate(m.updated), tonumber(m.count) or 0), Font = Enum.Font.Gotham,
+			TextSize = 10, TextColor3 = THEME.subtext, TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 25), Size = UDim2.new(1, -20, 0, 14),
+		}, open)
+		open.Activated:Connect(function()
+			local c = loadChat(m.id)
+			if c then
+				openChat(c)
+				setDrawer(false)
+			else
+				notice("⚠ Não foi possível carregar essa conversa.")
+			end
+		end)
+		local del = iconButton(item, "🗑", 28, 12, 0)
+		del.AnchorPoint, del.Position = Vector2.new(1, 0.5), UDim2.new(1, -8, 0.5, 0)
+		local armed = false
+		del.Activated:Connect(function()
+			if not armed then
+				armed = true
+				del.Text = "?"
+				task.delay(2, function()
+					armed = false
+					if del.Parent then del.Text = "🗑" end
+				end)
+			else
+				deleteChat(m.id)
+				refreshHistory()
+			end
+		end)
+	end
+end
+
+-- ═══════════════════════ CONFIRMACAO DE CODIGO ═══════════════════════
+local function actionButton(parent, text, color, size, pos)
+	local b = new("TextButton", {
+		Text = text, Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Color3.new(1, 1, 1),
+		AutoButtonColor = false, BackgroundColor3 = color, BorderSizePixel = 0, Size = size, Position = pos,
+	}, parent)
+	corner(b, 10)
+	return b
+end
+
+toolCtx.confirmCode = function(code, purpose)
+	local decision
+	local row, bubble = newRow("ai")
+	local msg = "⚠ A IA quer executar código no seu jogo"
+	if purpose and tostring(purpose) ~= "" then msg = msg .. ":\n" .. tostring(purpose) end
+	createText(bubble, msg, 1, { color = THEME.warn, size = 12 })
+	createCodeBlock(bubble, "lua", code, 2)
+	local btnRow = new("Frame", { LayoutOrder = 3, Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1 }, bubble)
+	local run = actionButton(btnRow, "▶ Executar", THEME.ok, UDim2.new(0.5, -4, 1, 0), UDim2.new(0, 0, 0, 0))
+	local cancel = actionButton(btnRow, "✕ Cancelar", THEME.danger, UDim2.new(0.5, -4, 1, 0), UDim2.new(0.5, 4, 0, 0))
+	run.Activated:Connect(function() decision = true end)
+	cancel.Activated:Connect(function() decision = false end)
+	requestScroll()
+	local t0 = os.clock()
+	while decision == nil and os.clock() - t0 < 180 and row.Parent do task.wait(0.1) end
+	if row.Parent then btnRow:Destroy() end
+	if row.Parent then
+		createText(bubble, decision and "✓ Aprovado pelo usuário" or "✕ Cancelado", 3,
+			{ color = decision and THEME.ok or THEME.danger, size = 11 })
+	end
+	return decision == true
+end
+
+-- ═══════════════════════ AGENTE (loop de ferramentas) ═══════════════════════
+local function execTool(c, name, args)
+	local tool = Tools[name]
+	if not tool then
+		addRecord(c, { k = "tool", name = name, ok = false, text = "ferramenta desconhecida" })
+		return false, "ferramenta desconhecida: " .. tostring(name)
+	end
+	setStatus("Executando " .. name)
+	local okCall, ok, msg = pcall(tool.fn, type(args) == "table" and args or {})
+	if not okCall then
+		ok, msg = false, "erro interno: " .. tostring(ok)
+	end
+	msg = tostring(msg or "")
+	local rec = { k = "tool", name = name, ok = ok and true or false, text = msg }
+	if name == "run_luau" and type(args) == "table" then rec.code = tostring(args.code or "") end
+	addRecord(c, rec)
+	return ok and true or false, msg
+end
+
+local function trimContents(c)
+	local contents = c.contents
+	while #contents > CONFIG.MAX_CONTEXT_ITEMS do table.remove(contents, 1) end
+	while contents[1] do
+		local first = contents[1]
+		local isUserText = first.role == "user" and first.parts and first.parts[1] and first.parts[1].text ~= nil
+		if isUserText then break end
+		table.remove(contents, 1)
+	end
+end
+
+local function buildRequestContents(c, turnStart, extras)
+	local out = {}
+	for i, item in ipairs(c.contents) do
+		if i == turnStart and extras and #extras > 0 then
+			local parts = {}
+			for _, e in ipairs(extras) do parts[#parts + 1] = e end
+			for _, p in ipairs(item.parts) do parts[#parts + 1] = p end
+			out[#out + 1] = { role = "user", parts = parts }
+		else
+			out[#out + 1] = item
+		end
+	end
+	return out
+end
+
+local function runAgentTurn(c, userText, extras)
+	trimContents(c)
+	local turnStart = #c.contents + 1
+	c.contents[turnStart] = { role = "user", parts = { { text = userText } } }
+	local onStatus = function(t) setStatus(t) end
+	local lastPrompt = 0
+
+	for round = 1, CONFIG.MAX_TOOL_ROUNDS + 1 do
+		local useTools = Settings.roblox and round <= CONFIG.MAX_TOOL_ROUNDS
+		local ctxText = buildServerContext(false)
+		local ok, res = apiGenerate(buildRequestContents(c, turnStart, extras), buildSystemPrompt(ctxText), useTools, onStatus)
+		if not ok then
+			while #c.contents >= turnStart do table.remove(c.contents) end -- descarta o turno incompleto
+			return false, res
+		end
+		lastPrompt = res.promptTokens or lastPrompt
+		c.contents[#c.contents + 1] = res.content
+
+		if res.text ~= "" then addRecord(c, { k = "ai", text = res.text }) end
+		if #res.calls == 0 then
+			if res.text == "" then addRecord(c, { k = "sys", text = "(a IA não retornou texto)" }) end
+			break
+		end
+
+		local responses = {}
+		for _, call in ipairs(res.calls) do
+			local okT, msg = execTool(c, call.name, call.args)
+			responses[#responses + 1] = {
+				functionResponse = {
+					id = call.id, name = call.name,
+					response = { success = okT, result = msg },
+				},
+			}
+		end
+		c.contents[#c.contents + 1] = { role = "user", parts = responses }
+	end
+
+	c.ctxTokens = lastPrompt
+	c.updated = os.time()
+	Chats[c.id] = c
+	markDirty("chat:" .. c.id)
+	return true
+end
+
+local function setBusy(b)
+	State.busy = b
+	sendBtn.BackgroundTransparency = b and 0.6 or 0
+	sendBtn.Text = b and "…" or "↑"
+end
+
+local function doSubmit(text, opts)
+	opts = opts or {}
+	if State.busy then
+		notice("⚠ Aguarde a resposta atual terminar.")
+		return
+	end
+	if Settings.apiKey == "" then
+		notice("⚠ Falta a API Key. Digite: /key SUA_CHAVE (grátis em aistudio.google.com/apikey)")
+		return
+	end
+	local chatObj = Current
+	setBusy(true)
+	inputBox.Text = ""
+	local visionOn = Settings.vision or opts.forceVision
+	addRecord(chatObj, { k = "user", text = text, vision = visionOn and "tela anexada" or nil })
+	local stop = showTyping()
+
+	task.spawn(function()
+		local okRun, ok, err = pcall(function()
+			local extras
+			if visionOn then
+				setStatus("Capturando a tela")
+				local snap = visionSnapshot(opts.forceVision)
+				extras = {}
+				if snap.image then extras[#extras + 1] = { inlineData = { mimeType = "image/png", data = snap.image } } end
+				extras[#extras + 1] = { text = "[Contexto visual automático da tela do usuário — método: " .. snap.method .. "]\n" .. snap.scan }
+				if snap.shotError and Vision.shotFails == 2 then
+					notice("ℹ Print indisponível (" .. shorten(tostring(snap.shotError), 90) .. "). Usando varredura de cena.")
+				end
+			end
+			return runAgentTurn(chatObj, text, extras)
+		end)
+		stop()
+		if not okRun then
+			addRecord(chatObj, { k = "sys", text = "⚠ Erro interno: " .. tostring(ok) })
+		elseif not ok then
+			addRecord(chatObj, { k = "sys", text = "⚠ " .. tostring(err) })
+		end
+		setBusy(false)
+		refreshUsageUI()
+	end)
+end
+submit = function(text) doSubmit(text) end
+
+-- ═══════════════════════ COMANDOS ═══════════════════════
+local COMMANDS = {
+	{ "ajuda", "Lista todos os comandos" },
+	{ "roblox", "Liga/desliga o modo Roblox (IA age no jogo)" },
+	{ "novo", "Abre um chat novo" },
+	{ "chats", "Abre o histórico de conversas" },
+	{ "limpar", "Limpa o chat atual" },
+	{ "apagar", "Apaga o chat atual" },
+	{ "renomear", "Renomeia o chat: /renomear novo nome" },
+	{ "exportar", "Copia o chat atual" },
+	{ "uso", "Mostra/oculta o painel de uso" },
+	{ "limite", "Define limites: /limite rpm 10 rpd 250" },
+	{ "modelo", "Troca o modelo: /modelo gemini-3.6-flash" },
+	{ "pensar", "Nível de raciocínio: minimal|low|medium|high" },
+	{ "key", "Define a API Key" },
+	{ "cor", "Cor de destaque: azul roxo verde rosa laranja ciano" },
+	{ "ctx", "Mostra o contexto lido do servidor" },
+	{ "ver", "Liga/desliga a visão da tela (👁)" },
+	{ "tela", "Envia um print agora: /tela sua pergunta" },
+	{ "auto", "Executa código da IA sem confirmar (cuidado)" },
+	{ "npc", "Cria um NPC na sua frente: /npc Nome", roblox = true },
+	{ "peca", "Cria uma peça: /peca vermelho", roblox = true },
+	{ "tp", "Teleporta: /tp x y z  ou  /tp jogador", roblox = true },
+	{ "vel", "WalkSpeed: /vel 50", roblox = true },
+	{ "pulo", "JumpPower: /pulo 80", roblox = true },
+	{ "grav", "Gravidade: /grav 50", roblox = true },
+	{ "fov", "Campo de visão: /fov 90", roblox = true },
+	{ "hora", "Hora do dia: /hora 22", roblox = true },
+	{ "pos", "Mostra sua posição", roblox = true },
+	{ "jogadores", "Lista os jogadores do servidor", roblox = true },
+	{ "perto", "Objetos próximos: /perto 60", roblox = true },
+	{ "limparobj", "Remove tudo que a IA/comandos criaram", roblox = true },
+	{ "run", "Executa Luau (com confirmação): /run código", roblox = true },
+}
+
+local function helpText()
+	local a, b = {}, {}
+	for _, d in ipairs(COMMANDS) do
+		local line = "/" .. d[1] .. "  —  " .. d[2]
+		if d.roblox then b[#b + 1] = line else a[#a + 1] = line end
+	end
+	local out = "Comandos gerais:\n" .. table.concat(a, "\n")
+	if Settings.roblox then
+		out = out .. "\n\nComandos Roblox (ativos):\n" .. table.concat(b, "\n")
+			.. "\n\nDica: no modo Roblox você também pode pedir em linguagem natural: “coloque um NPC na minha frente”."
+	else
+		out = out .. "\n\nDigite /roblox para ativar os comandos de jogo e deixar a IA agir no Roblox."
+	end
+	return out
+end
+
+setRobloxMode = function(on, silent)
+	Settings.roblox = on
+	markDirty("settings")
+	updateSubtitle()
+	if silent then
+		notice(on and "🧩 Modo Roblox ATIVADO — a IA agora pode agir no jogo." or "Modo Roblox desativado.")
+	elseif on then
+		notice("🧩 Modo Roblox ATIVADO.\n" .. helpText())
+	else
+		notice("Modo Roblox desativado.")
+	end
+end
+
+local function needRoblox()
+	if Settings.roblox then return true end
+	notice("Ative o modo Roblox primeiro: /roblox")
+	return false
+end
+
+local function directTool(name, args)
+	if not needRoblox() then return end
+	task.spawn(function() execTool(Current, name, args) end)
+end
+
+local CMD = {}
+CMD.ajuda = function() notice(helpText()) end
+CMD.help = CMD.ajuda
+CMD.roblox = function(arg)
+	local a = arg:lower()
+	if a == "off" or a == "desligar" then
+		setRobloxMode(false)
+	elseif a == "on" or a == "ligar" then
+		setRobloxMode(true)
+	else
+		setRobloxMode(not Settings.roblox)
+	end
+end
+CMD.novo = function() newChat() end
+CMD.chats = function() setDrawer(not drawerOpen) end
+CMD.limpar = function()
+	if State.busy then notice("⚠ Aguarde a resposta atual terminar.") return end
+	Current.log, Current.contents, Current.ctxTokens = {}, {}, 0
+	Current.title = "Novo chat"
+	markDirty("chat:" .. Current.id)
+	touchIndex(Current)
+	renderChat(Current)
+end
+CMD.apagar = function()
+	if State.busy then notice("⚠ Aguarde a resposta atual terminar.") return end
+	deleteChat(Current.id)
+end
+CMD.renomear = function(arg)
+	if arg == "" then notice("Uso: /renomear novo nome") return end
+	Current.title = shorten(arg, 40)
+	Chats[Current.id] = Current
+	touchIndex(Current)
+	markDirty("chat:" .. Current.id)
+	notice("✓ Chat renomeado para “" .. Current.title .. "”.")
+end
+CMD.exportar = function() flash(copyAllBtn, copyToClipboard(exportText(Current))) end
+CMD.uso = function()
+	usagePanel.Visible = not usagePanel.Visible
+	refreshUsageUI()
+end
+CMD.limite = function(arg)
+	local changed = {}
+	for key, val in arg:lower():gmatch("(%a+)%s+(%d+)") do
+		local n = tonumber(val)
+		if n and n > 0 then
+			if key == "rpm" then Settings.rpm = n changed[#changed + 1] = "rpm=" .. n
+			elseif key == "rpd" then Settings.rpd = n changed[#changed + 1] = "rpd=" .. n
+			elseif key == "tokens" or key == "tpd" then Settings.tpd = n changed[#changed + 1] = "tokens/dia=" .. n end
+		end
+	end
+	if #changed == 0 then
+		notice(("Limites atuais: rpm=%d, rpd=%d, tokens/dia=%d\nUso: /limite rpm 10 rpd 250 tokens 1000000"):format(Settings.rpm, Settings.rpd, Settings.tpd))
+	else
+		markDirty("settings")
+		notice("✓ Limites: " .. table.concat(changed, ", "))
+		refreshUsageUI()
+	end
+end
+CMD.modelo = function(arg)
+	if arg == "" then notice("Modelo atual: " .. (State.activeModel or Settings.model)) return end
+	Settings.model = arg
+	State.activeModel, State.noThinking = nil, false
+	markDirty("settings")
+	updateSubtitle()
+	notice("✓ Modelo: " .. arg)
+end
+CMD.pensar = function(arg)
+	local a = arg:lower()
+	if a == "minimal" or a == "low" or a == "medium" or a == "high" or a == "" then
+		Settings.thinking = a
+		State.noThinking = false
+		markDirty("settings")
+		notice(a == "" and "✓ Raciocínio: padrão do modelo" or ("✓ Raciocínio: " .. a))
+	else
+		notice("Uso: /pensar minimal|low|medium|high  (low = mais rápido)")
+	end
+end
+CMD.key = function(arg)
+	if arg == "" then notice("Uso: /key SUA_API_KEY") return end
+	Settings.apiKey = trim(arg)
+	markDirty("settings")
+	notice("✓ API Key configurada e salva.")
+end
+CMD.cor = function(arg)
+	local a = arg:lower()
+	if ACCENTS[a] then
+		Settings.accent = a
+		markDirty("settings")
+		applyAccent()
+		notice("✓ Cor: " .. a)
+	else
+		notice("Cores: azul, roxo, verde, rosa, laranja, ciano")
+	end
+end
+CMD.ctx = function()
+	task.spawn(function() notice("📡 Contexto do servidor:\n" .. buildServerContext(true)) end)
+end
+CMD.ver = function()
+	Settings.vision = not Settings.vision
+	markDirty("settings")
+	updateSubtitle()
+	notice(Settings.vision and "👁 Visão ligada: cada mensagem leva um print + varredura da cena." or "👁 Visão desligada.")
+end
+CMD.tela = function(arg)
+	local q = arg ~= "" and arg or "Descreva o que você está vendo na minha tela agora."
+	doSubmit(q, { forceVision = true })
+end
+CMD.auto = function()
+	Settings.autoRun = not Settings.autoRun
+	markDirty("settings")
+	updateSubtitle()
+	notice(Settings.autoRun and "⚠ Auto-run LIGADO: código da IA roda sem confirmação." or "✓ Auto-run desligado (a IA pede confirmação).")
+end
+CMD.npc = function(arg) directTool("spawn_npc", { name = arg ~= "" and arg or "NPC" }) end
+CMD.peca = function(arg) directTool("spawn_part", { color = arg }) end
+CMD.tp = function(arg)
+	local x, y, z = arg:match("^(-?[%d%.]+)[%s,]+(-?[%d%.]+)[%s,]+(-?[%d%.]+)$")
+	if x then
+		directTool("teleport", { x = tonumber(x), y = tonumber(y), z = tonumber(z) })
+	elseif arg ~= "" then
+		directTool("teleport", { player_name = arg })
+	else
+		notice("Uso: /tp x y z  ou  /tp jogador")
+	end
+end
+CMD.vel = function(arg) directTool("set_player", { walk_speed = tonumber(arg) }) end
+CMD.pulo = function(arg) directTool("set_player", { jump_power = tonumber(arg) }) end
+CMD.grav = function(arg) directTool("set_player", { gravity = tonumber(arg) }) end
+CMD.fov = function(arg) directTool("set_player", { fov = tonumber(arg) }) end
+CMD.hora = function(arg) directTool("set_environment", { clock_time = tonumber(arg) }) end
+CMD.pos = function()
+	if not needRoblox() then return end
+	local _, root = myRig()
+	if root then
+		notice(("📍 Posição: %.1f, %.1f, %.1f"):format(root.Position.X, root.Position.Y, root.Position.Z))
+	else
+		notice("⚠ Personagem não encontrado.")
+	end
+end
+CMD.jogadores = function()
+	if not needRoblox() then return end
+	local names = {}
+	for _, p in ipairs(Players:GetPlayers()) do names[#names + 1] = p.DisplayName .. " (@" .. p.Name .. ")" end
+	notice(("👥 %d jogador(es):\n%s"):format(#names, table.concat(names, "\n")))
+end
+CMD.perto = function(arg) directTool("get_nearby", { radius = tonumber(arg) }) end
+CMD.limparobj = function() directTool("remove_spawned", { name = "all" }) end
+CMD.run = function(arg)
+	if arg == "" then notice("Uso: /run print('oi')") return end
+	directTool("run_luau", { code = arg, purpose = "comando /run" })
+end
+
+local function handleCommand(text)
+	local name, arg = text:match("^/(%S+)%s*(.*)$")
+	name = name and name:lower() or ""
+	inputBox.Text = ""
+	local fn = CMD[name]
+	if fn then
+		local ok, err = pcall(fn, arg or "")
+		if not ok then notice("⚠ Erro no comando: " .. tostring(err)) end
+	else
+		notice("Comando desconhecido. Digite /ajuda.")
+	end
+end
+
+local function sendFromInput()
+	local text = trim(inputBox.Text)
+	if text == "" then return end
+	if text:sub(1, 1) == "/" then
+		handleCommand(text)
+	else
+		doSubmit(text)
+	end
+end
+
+-- Paleta: sugestoes ao digitar "/" -----------------------------
+local function updatePalette()
+	for _, c in ipairs(palette:GetChildren()) do
+		if c:IsA("TextButton") then c:Destroy() end
+	end
+	local text = inputBox.Text
+	if text:sub(1, 1) ~= "/" or text:find("%s") then
+		palette.Visible = false
+		return
+	end
+	local q = text:sub(2):lower()
+	local n = 0
+	for _, def in ipairs(COMMANDS) do
+		if (not def.roblox or Settings.roblox) and def[1]:sub(1, #q) == q then
+			n = n + 1
+			if n > 5 then break end
+			local b = new("TextButton", {
+				LayoutOrder = n, AutoButtonColor = false, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 28),
+				Text = "", ZIndex = 6,
+			}, palette)
+			corner(b, 8)
+			new("TextLabel", {
+				RichText = true, BackgroundTransparency = 1, Size = UDim2.new(1, -16, 1, 0), Position = UDim2.fromOffset(8, 0),
+				Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = THEME.text, TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 6,
+				Text = ("<b>/%s</b>  <font color=\"#9696A6\">%s</font>"):format(def[1], escapeRich(def[2])),
+			}, b)
+			b.Activated:Connect(function()
+				inputBox.Text = "/" .. def[1] .. " "
+				inputBox:CaptureFocus()
+			end)
+		end
+	end
+	palette.Visible = n > 0
+end
+
+-- ═══════════════════════ ARRASTE / MINIMIZAR / TECLADO ═══════════════════════
+local kbSaved = nil
+
+local function clampMain(x, y, w, h)
+	local sc = gui.AbsoluteSize
+	w, h = w or W, h or main.AbsoluteSize.Y
+	return math.clamp(x, 4, math.max(4, sc.X - w - 4)), math.clamp(y, 4, math.max(4, sc.Y - h - 4))
+end
+
+do
+	local dragging, dragInput, dragStart = false, nil, Vector3.new(0, 0, 0)
+	local startX, startY = 0, 0
+	topbar.InputBegan:Connect(function(input)
+		local t = input.UserInputType
+		if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+			dragging, dragInput, dragStart = true, input, input.Position
+			startX, startY = main.Position.X.Offset, main.Position.Y.Offset
+			if kbSaved then kbSaved.y = nil end
+			local conn
+			conn = input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					if conn then conn:Disconnect() end
+				end
+			end)
+		end
+	end)
+	bind(UserInputService.InputChanged, function(input)
+		if not dragging then return end
+		local t = input.UserInputType
+		if t == Enum.UserInputType.MouseMovement or (t == Enum.UserInputType.Touch and input == dragInput) then
+			local d = input.Position - dragStart
+			local x, y = clampMain(startX + d.X, startY + d.Y)
+			main.Position = UDim2.fromOffset(x, y)
+		end
+	end)
+	bind(UserInputService.InputEnded, function(input)
+		local t = input.UserInputType
+		if t == Enum.UserInputType.MouseButton1 or (t == Enum.UserInputType.Touch and input == dragInput) then
+			dragging = false
+		end
+	end)
+end
+
+bind(gui:GetPropertyChangedSignal("AbsoluteSize"), function()
+	local x, y = clampMain(main.Position.X.Offset, main.Position.Y.Offset)
+	main.Position = UDim2.fromOffset(x, y)
+end)
+
+local function fitAboveKeyboard()
+	if minimized or not inputBox:IsFocused() then return end
+	if not UserInputService.OnScreenKeyboardVisible then return end
+	local kbTop = UserInputService.OnScreenKeyboardPosition.Y
+	if main.AbsolutePosition.Y + main.AbsoluteSize.Y <= kbTop - 8 then return end
+	if not kbSaved then kbSaved = { y = main.Position.Y.Offset, h = expandedH } end
+	local newH = math.clamp(kbTop - 16, MIN_H, expandedH)
+	local newY = math.max(4, kbTop - newH - 8)
+	tween(main, 0.25, {
+		Size = UDim2.fromOffset(W, newH),
+		Position = UDim2.fromOffset(main.Position.X.Offset, newY),
+	})
+end
+
+local function restoreFromKeyboard()
+	if not kbSaved then return end
+	local saved = kbSaved
+	kbSaved = nil
+	local x, y = clampMain(main.Position.X.Offset, saved.y or main.Position.Y.Offset, W, saved.h)
+	tween(main, 0.25, { Size = UDim2.fromOffset(W, saved.h), Position = UDim2.fromOffset(x, y) })
+end
+
+local function delayedRestore()
+	task.delay(0.3, function()
+		if not inputBox:IsFocused() and not UserInputService.OnScreenKeyboardVisible then restoreFromKeyboard() end
+	end)
+end
+
+bind(inputBox.Focused, function() task.delay(0.35, fitAboveKeyboard) end)
+bind(inputBox.FocusLost, delayedRestore)
+bind(UserInputService:GetPropertyChangedSignal("OnScreenKeyboardVisible"), function()
+	if UserInputService.OnScreenKeyboardVisible then
+		task.delay(0.15, fitAboveKeyboard)
+	else
+		delayedRestore()
+	end
+end)
+
+local animToken = 0
+local function setMinimized(state)
+	if state == minimized then return end
+	minimized = state
+	animToken = animToken + 1
+	local token = animToken
+	inputBox:ReleaseFocus()
+	restoreFromKeyboard()
+	if state then
+		minBtn.Text = "+"
+		minBtn:SetAttribute("OrigText", "+")
+		setDrawer(false)
+		usagePanel.Visible = false
+		body.Size = UDim2.new(1, 0, 0, math.max(0, main.AbsoluteSize.Y - TOP_H))
+		local tw = tween(main, 0.3, { Size = UDim2.fromOffset(W, TOP_H) })
+		tw.Completed:Connect(function()
+			if token == animToken and minimized then body.Visible = false end
+		end)
+	else
+		minBtn.Text = "-"
+		minBtn:SetAttribute("OrigText", "-")
+		body.Size = UDim2.new(1, 0, 0, expandedH - TOP_H)
+		body.Visible = true
+		local goal = { Size = UDim2.fromOffset(W, expandedH) }
+		local _, y = clampMain(main.Position.X.Offset, main.Position.Y.Offset, W, expandedH)
+		if y ~= main.Position.Y.Offset then goal.Position = UDim2.fromOffset(main.Position.X.Offset, y) end
+		local tw = tween(main, 0.3, goal)
+		tw.Completed:Connect(function()
+			if token == animToken and not minimized then
+				body.Size = UDim2.new(1, 0, 1, -TOP_H)
+				requestScroll()
+			end
+		end)
+	end
+end
+
+-- ═══════════════════════ EVENTOS ═══════════════════════
+minBtn.Activated:Connect(function() setMinimized(not minimized) end)
+histBtn.Activated:Connect(function() setDrawer(not drawerOpen) end)
+newBtn.Activated:Connect(function() newChat() end)
+drawerNew.Activated:Connect(function()
+	newChat()
+	setDrawer(false)
+end)
+copyAllBtn.Activated:Connect(function()
+	if Current and #Current.log > 0 then
+		flash(copyAllBtn, copyToClipboard(exportText(Current)))
+	else
+		flash(copyAllBtn, false)
+	end
+end)
+visionBtn.Activated:Connect(function() CMD.ver("") end)
+strip.Activated:Connect(function() CMD.uso("") end)
+sendBtn.Activated:Connect(sendFromInput)
+searchBox:GetPropertyChangedSignal("Text"):Connect(function() refreshHistory() end)
+
+bind(inputBox:GetPropertyChangedSignal("Text"), function()
+	if UserInputService.KeyboardEnabled and inputBox.Text:sub(-1) == "\n"
+		and not UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+		and not UserInputService:IsKeyDown(Enum.KeyCode.RightShift) then
+		inputBox.Text = inputBox.Text:sub(1, -2)
+		sendFromInput()
+		return
+	end
+	updatePalette()
+end)
+
+-- Atualiza o medidor periodicamente (o RPM "decai" com o tempo)
+local alive = true
+task.spawn(function()
+	while alive and gui.Parent do
+		if not minimized then refreshUsageUI() end
+		task.wait(2)
+	end
+end)
+
+ENV.__AnonimoAI_Cleanup = function()
+	alive = false
+	pcall(flushSaves)
+	for _, c in ipairs(connections) do
+		pcall(function() c:Disconnect() end)
+	end
+	if gui then gui:Destroy() end
+end
+
+-- ═══════════════════════ INICIALIZACAO ═══════════════════════
+loadPersisted()
+rollDay()
+applyAccent()
+updateSubtitle()
+
+local startChat
+if Settings.current and Settings.current ~= false then startChat = loadChat(Settings.current) end
+if not startChat and Index[1] then startChat = loadChat(Index[1].id) end
+openChat(startChat or newChatObject())
+refreshUsageUI()
+
+if not FS_OK then
+	notice("⚠ Seu executor não tem writefile/readfile: as conversas NÃO serão salvas.")
+end
+if Settings.apiKey == "" then
+	notice("⚠ Falta a API Key. Digite: /key SUA_CHAVE (grátis em aistudio.google.com/apikey)")
+end
+
+task.spawn(buildServerContext, true) -- pre-aquece o contexto do servidor
